@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -13,7 +13,7 @@ use crate::analysis::call_tree;
 use crate::analysis::flamegraph;
 use crate::analysis::functions::{self, FunctionStats};
 use crate::profile::parse::load_profile;
-use crate::profile::resolved::ResolvedProfile;
+use crate::profile::resolved::{ResolvedProfile, ResolvedThread};
 
 /// Pre-computed analysis data cached per thread
 #[derive(Debug)]
@@ -34,38 +34,73 @@ impl AnalysisCache {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ProfileServer {
+/// A loaded and analyzed profile with its cache.
+struct CachedProfile {
     profile: Arc<ResolvedProfile>,
     cache: Arc<AnalysisCache>,
+}
+
+#[derive(Clone)]
+pub struct ProfileServer {
+    profiles: Arc<Mutex<HashMap<PathBuf, Arc<CachedProfile>>>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
+impl std::fmt::Debug for ProfileServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProfileServer").finish()
+    }
+}
+
 impl ProfileServer {
-    pub fn new(profile: ResolvedProfile) -> Self {
-        let cache = AnalysisCache::build(&profile);
+    pub fn new() -> Self {
         Self {
-            profile: Arc::new(profile),
-            cache: Arc::new(cache),
+            profiles: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
     }
 
-    fn find_thread(
-        &self,
-        thread_name: &Option<String>,
-    ) -> Option<&crate::profile::resolved::ResolvedThread> {
-        match thread_name {
-            Some(name) => self.profile.threads.iter().find(|t| t.name == *name),
-            None => {
-                // Default: main thread, or first thread
-                self.profile
-                    .threads
-                    .iter()
-                    .find(|t| t.is_main)
-                    .or(self.profile.threads.first())
+    fn get_profile(&self, path: &str) -> Result<Arc<CachedProfile>, String> {
+        let canonical =
+            std::fs::canonicalize(path).map_err(|e| format!("Invalid path '{}': {}", path, e))?;
+
+        {
+            let cache = self.profiles.lock().unwrap();
+            if let Some(cached) = cache.get(&canonical) {
+                return Ok(Arc::clone(cached));
             }
+        }
+
+        let profile = load_profile(&canonical)
+            .map_err(|e| format!("Failed to load profile '{}': {}", path, e))?;
+        let analysis_cache = AnalysisCache::build(&profile);
+        let cached = Arc::new(CachedProfile {
+            profile: Arc::new(profile),
+            cache: Arc::new(analysis_cache),
+        });
+
+        self.profiles
+            .lock()
+            .unwrap()
+            .insert(canonical, Arc::clone(&cached));
+        Ok(cached)
+    }
+}
+
+fn find_thread<'a>(
+    profile: &'a ResolvedProfile,
+    thread_name: &Option<String>,
+) -> Option<&'a ResolvedThread> {
+    match thread_name {
+        Some(name) => profile.threads.iter().find(|t| t.name == *name),
+        None => {
+            // Default: main thread, or first thread
+            profile
+                .threads
+                .iter()
+                .find(|t| t.is_main)
+                .or(profile.threads.first())
         }
     }
 }
@@ -73,13 +108,22 @@ impl ProfileServer {
 // ── Request types ──
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ProfileInfoRequest {}
+pub struct ProfileInfoRequest {
+    #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
+    pub path: String,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ProfileThreadsRequest {}
+pub struct ProfileThreadsRequest {
+    #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
+    pub path: String,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TopFunctionsRequest {
+    #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
+    pub path: String,
+
     #[schemars(description = "Thread name to analyze (omit for main thread)")]
     #[serde(default)]
     pub thread: Option<String>,
@@ -103,6 +147,9 @@ fn default_limit() -> usize {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CallTreeRequest {
+    #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
+    pub path: String,
+
     #[schemars(description = "Thread name to analyze (omit for main thread)")]
     #[serde(default)]
     pub thread: Option<String>,
@@ -126,12 +173,18 @@ fn default_min_percent() -> f64 {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FunctionDetailRequest {
+    #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
+    pub path: String,
+
     #[schemars(description = "Name of the function to look up")]
     pub function_name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MarkersRequest {
+    #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
+    pub path: String,
+
     #[schemars(description = "Thread name (omit for main thread)")]
     #[serde(default)]
     pub thread: Option<String>,
@@ -147,6 +200,9 @@ fn default_marker_limit() -> usize {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FlamegraphRequest {
+    #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
+    pub path: String,
+
     #[schemars(description = "Thread name (omit for main thread)")]
     #[serde(default)]
     pub thread: Option<String>,
@@ -254,15 +310,18 @@ impl ProfileServer {
     )]
     fn profile_info(
         &self,
-        Parameters(_req): Parameters<ProfileInfoRequest>,
+        Parameters(req): Parameters<ProfileInfoRequest>,
     ) -> Result<Json<ProfileInfoResult>, String> {
+        let cached = self.get_profile(&req.path)?;
+        let profile = &cached.profile;
+
         Ok(Json(ProfileInfoResult {
-            product: self.profile.product.clone(),
-            duration_ms: self.profile.duration_ms,
-            total_samples: self.profile.total_sample_count,
-            thread_count: self.profile.threads.len(),
-            interval_ms: self.profile.interval_ms,
-            categories: self.profile.categories.clone(),
+            product: profile.product.clone(),
+            duration_ms: profile.duration_ms,
+            total_samples: profile.total_sample_count,
+            thread_count: profile.threads.len(),
+            interval_ms: profile.interval_ms,
+            categories: profile.categories.clone(),
         }))
     }
 
@@ -271,10 +330,12 @@ impl ProfileServer {
     )]
     fn profile_threads(
         &self,
-        Parameters(_req): Parameters<ProfileThreadsRequest>,
+        Parameters(req): Parameters<ProfileThreadsRequest>,
     ) -> Result<Json<ProfileThreadsResult>, String> {
-        let threads = self
-            .profile
+        let cached = self.get_profile(&req.path)?;
+        let profile = &cached.profile;
+
+        let threads = profile
             .threads
             .iter()
             .map(|t| ThreadInfo {
@@ -296,9 +357,10 @@ impl ProfileServer {
         &self,
         Parameters(req): Parameters<TopFunctionsRequest>,
     ) -> Result<Json<TopFunctionsResult>, String> {
-        let thread = self.find_thread(&req.thread).ok_or("Thread not found")?;
+        let cached = self.get_profile(&req.path)?;
+        let thread = find_thread(&cached.profile, &req.thread).ok_or("Thread not found")?;
 
-        let mut stats = self
+        let mut stats = cached
             .cache
             .function_stats
             .get(&thread.name)
@@ -338,6 +400,8 @@ impl ProfileServer {
         &self,
         Parameters(req): Parameters<FunctionDetailRequest>,
     ) -> Result<Json<FunctionDetailResult>, String> {
+        let cached = self.get_profile(&req.path)?;
+        let profile = &cached.profile;
         let target = &req.function_name;
 
         let mut total_self_time = 0.0;
@@ -352,9 +416,9 @@ impl ProfileServer {
         let mut callees: HashMap<String, usize> = HashMap::new();
         let mut found_threads = Vec::new();
 
-        for thread in &self.profile.threads {
+        for thread in &profile.threads {
             // Check function stats
-            if let Some(stats) = self.cache.function_stats.get(&thread.name)
+            if let Some(stats) = cached.cache.function_stats.get(&thread.name)
                 && let Some(s) = stats.iter().find(|s| s.name == *target)
             {
                 total_self_time += s.self_time_ms;
@@ -440,7 +504,8 @@ impl ProfileServer {
         &self,
         Parameters(req): Parameters<CallTreeRequest>,
     ) -> Result<Json<CallTreeResult>, String> {
-        let thread = self.find_thread(&req.thread).ok_or("Thread not found")?;
+        let cached = self.get_profile(&req.path)?;
+        let thread = find_thread(&cached.profile, &req.thread).ok_or("Thread not found")?;
 
         let tree = call_tree::build_call_tree(thread, req.max_depth, req.min_percent);
         let text = tree.render_text(req.max_depth);
@@ -458,7 +523,8 @@ impl ProfileServer {
         &self,
         Parameters(req): Parameters<MarkersRequest>,
     ) -> Result<Json<MarkersResult>, String> {
-        let thread = self.find_thread(&req.thread).ok_or("Thread not found")?;
+        let cached = self.get_profile(&req.path)?;
+        let thread = find_thread(&cached.profile, &req.thread).ok_or("Thread not found")?;
 
         let markers: Vec<MarkerInfo> = thread
             .markers
@@ -486,7 +552,8 @@ impl ProfileServer {
         &self,
         Parameters(req): Parameters<FlamegraphRequest>,
     ) -> Result<Json<FlamegraphResult>, String> {
-        let thread = self.find_thread(&req.thread).ok_or("Thread not found")?;
+        let cached = self.get_profile(&req.path)?;
+        let thread = find_thread(&cached.profile, &req.thread).ok_or("Thread not found")?;
 
         let stacks = flamegraph::collapsed_stacks(thread);
 
@@ -504,11 +571,13 @@ impl ServerHandler for ProfileServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Samply profiler analysis tools. Use profile_info for metadata overview, \
-                 profile_threads to list threads, profile_top_functions to find CPU hotspots, \
-                 profile_call_tree for hierarchical call analysis, profile_function_detail \
-                 for deep-dive into a specific function's callers/callees, profile_markers \
-                 for timeline events, and profile_flamegraph for collapsed stack output."
+                "Samply profiler analysis tools. Every tool requires a `path` parameter \
+                 pointing to a profile JSON file (or .json.gz). Use profile_info for metadata \
+                 overview, profile_threads to list threads, profile_top_functions to find CPU \
+                 hotspots, profile_call_tree for hierarchical call analysis, \
+                 profile_function_detail for deep-dive into a specific function's \
+                 callers/callees, profile_markers for timeline events, and profile_flamegraph \
+                 for collapsed stack output."
                     .to_string(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -521,9 +590,8 @@ fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
-pub async fn run_server(profile_path: &Path) -> Result<()> {
-    let profile = load_profile(profile_path)?;
-    let server = ProfileServer::new(profile);
+pub async fn run_server() -> Result<()> {
+    let server = ProfileServer::new();
 
     let service = server
         .serve((tokio::io::stdin(), tokio::io::stdout()))

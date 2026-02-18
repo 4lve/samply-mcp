@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "samply-mcp")]
@@ -12,9 +11,6 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Run as MCP server for a given profile
-    Mcp {
-        /// Path to profile.json or profile.json.gz
-        profile_path: PathBuf,
-    },
+    /// Run as MCP server (profiles loaded on-demand via path parameter)
+    Mcp,
 }

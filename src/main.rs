@@ -12,8 +12,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Mcp { profile_path } => {
-            mcp::run_server(&profile_path).await?;
+        Commands::Mcp => {
+            mcp::run_server().await?;
         }
     }
 

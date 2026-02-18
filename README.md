@@ -1,19 +1,21 @@
 # samply-mcp
 
-An MCP server that lets AI assistants analyze [samply](https://github.com/mstange/samply) CPU profiles. Point it at a `.json.gz` profile and ask Claude to find hotspots, explore call trees, and explain what's slow.
+An MCP server that lets AI assistants analyze [samply](https://github.com/mstange/samply) CPU profiles. Register it once, then ask Claude to analyze any profile by path — find hotspots, explore call trees, and explain what's slow.
 
 ## What it does
 
 ```
 $ samply record --save-only --unstable-presymbolicate -o profile.json.gz -- ./my-program
-$ claude mcp add --scope project samply /path/to/samply-mcp mcp profile.json.gz
+$ claude mcp add samply /path/to/samply-mcp mcp
 ```
 
 Then in Claude Code, just ask:
 
-> "What are the top CPU hotspots in this profile?"
+> "What are the top CPU hotspots in /tmp/profile.json.gz?"
 > "Show me the call tree for the main thread"
 > "What's calling `vec::sort` the most?"
+
+Every tool accepts a `path` parameter, so one server installation works for any profile.
 
 ## Available MCP Tools
 
@@ -27,6 +29,8 @@ Then in Claude Code, just ask:
 | `profile_markers` | Timeline markers and events |
 | `profile_flamegraph` | Collapsed stack format (Brendan Gregg) for generating flamegraphs |
 
+All tools require a `path` parameter pointing to a profile `.json` or `.json.gz` file. Profiles are loaded on first use and cached in memory.
+
 ## Recording a Profile
 
 Install [samply](https://github.com/mstange/samply):
@@ -38,7 +42,8 @@ cargo install samply
 Record your program. The `--unstable-presymbolicate` flag writes a `.syms.json` sidecar that samply-mcp uses to resolve function names automatically:
 
 ```bash
-samply record --save-only --unstable-presymbolicate -o profile.json.gz -- ./my-program
+samply record --save-only --unstable-presymbolicate -o profile.json.gz -- ./target/profiling/my-program
+
 ```
 
 This produces `profile.json.gz` (and `profile.json.syms.json` alongside it). samply-mcp picks up the sidecar automatically — no manual symbolication needed.
@@ -59,10 +64,10 @@ cargo build --release
 ### Claude Code (CLI)
 
 ```bash
-claude mcp add --scope project samply /path/to/samply-mcp mcp /path/to/profile.json.gz
+claude mcp add samply /path/to/samply-mcp mcp
 ```
 
-Restart Claude Code after adding. The MCP server parses and symbolizes the profile on startup — all tools then query the in-memory resolved data.
+No profile path needed — profiles are loaded on-demand when tools are called.
 
 ### Claude Desktop
 
@@ -73,7 +78,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
   "mcpServers": {
     "samply": {
       "command": "/path/to/samply-mcp",
-      "args": ["mcp", "/path/to/profile.json.gz"]
+      "args": ["mcp"]
     }
   }
 }
@@ -89,9 +94,8 @@ cargo build
 samply record --save-only --unstable-presymbolicate \
   -o /tmp/profile.json.gz -- ./target/debug/my-program
 
-# 3. Register the MCP server for this project
-claude mcp add --scope project samply \
-  ~/path/to/samply-mcp mcp /tmp/profile.json.gz
+# 3. Register the MCP server (once, globally or per-project)
+claude mcp add samply ~/path/to/samply-mcp mcp
 
-# 4. Open Claude Code in your project and ask it to analyze
+# 4. Open Claude Code and ask it to analyze by path
 ```

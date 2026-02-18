@@ -31,21 +31,23 @@ src/
 
 ## MCP Tools
 
-- `profile_info` — metadata: duration, sample count, thread count, interval, categories
-- `profile_threads` — list threads with names, sample counts, time ranges
-- `profile_top_functions` — top N functions by self/total time (params: thread, sort_by, limit)
-- `profile_call_tree` — hierarchical call tree with time % (params: thread, depth, min_percent)
-- `profile_function_detail` — callers/callees/source for one function (params: function_name)
-- `profile_markers` — timeline markers/events (params: thread, limit)
-- `profile_flamegraph` — collapsed stack format text (params: thread)
+All tools require a `path` parameter pointing to a profile file. Profiles are loaded on-demand and cached in memory.
+
+- `profile_info` — metadata: duration, sample count, thread count, interval, categories (params: path)
+- `profile_threads` — list threads with names, sample counts, time ranges (params: path)
+- `profile_top_functions` — top N functions by self/total time (params: path, thread, sort_by, limit)
+- `profile_call_tree` — hierarchical call tree with time % (params: path, thread, depth, min_percent)
+- `profile_function_detail` — callers/callees/source for one function (params: path, function_name)
+- `profile_markers` — timeline markers/events (params: path, thread, limit)
+- `profile_flamegraph` — collapsed stack format text (params: path, thread)
 
 ## Usage
 
 ```bash
-samply-mcp mcp <profile.json.gz>
+samply-mcp mcp
 ```
 
-Starts an MCP server on stdio. The profile is parsed and analyzed on startup; all tools query the in-memory resolved profile.
+Starts an MCP server on stdio. Profiles are loaded on-demand when tools are called with a `path` parameter, and cached in memory for subsequent requests.
 
 ## Test Fixtures
 
