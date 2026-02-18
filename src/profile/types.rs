@@ -77,6 +77,8 @@ pub struct RawLib {
     #[serde(default)]
     pub debug_path: String,
     #[serde(default)]
+    pub breakpad_id: String,
+    #[serde(default)]
     pub arch: Option<String>,
 }
 
