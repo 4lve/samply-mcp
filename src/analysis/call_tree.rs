@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::analysis::symbols;
-use crate::profile::resolved::ResolvedThread;
+use crate::profile::resolved::{ResolvedFrame, ResolvedThread};
 
 #[derive(Debug, Clone)]
 pub struct CallTreeNode {
@@ -20,6 +20,12 @@ pub struct FocusedCallTree {
     pub total_samples: usize,
     pub focused_time_ms: f64,
     pub focused_percent: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerRelationship {
+    Ancestor,
+    Immediate,
 }
 
 pub fn build_call_tree_with_filter(
@@ -150,7 +156,128 @@ pub fn build_focused_call_tree_with_filter(
     })
 }
 
-fn sample_interval_ms(thread: &ResolvedThread) -> f64 {
+pub fn build_focused_call_tree_under_caller_with_filter(
+    threads: &[&ResolvedThread],
+    function_name: &str,
+    caller_name: &str,
+    caller_relationship: CallerRelationship,
+    max_depth: usize,
+    min_percent: f64,
+    mut include_frame: impl FnMut(&str) -> bool,
+) -> Option<FocusedCallTree> {
+    let total_thread_time: f64 = threads
+        .iter()
+        .map(|thread| sample_interval_ms(thread) * thread.samples.len() as f64)
+        .sum();
+    let total_samples = threads.iter().map(|thread| thread.samples.len()).sum();
+
+    let mut root = TreeBuilder::new(function_name.to_string());
+    let mut matched_samples = 0usize;
+
+    for thread in threads {
+        let interval_ms = sample_interval_ms(thread);
+
+        for sample in &thread.samples {
+            let Some(focus_index) = function_under_caller_index(
+                &sample.stack,
+                function_name,
+                caller_name,
+                caller_relationship,
+            ) else {
+                continue;
+            };
+
+            matched_samples += 1;
+            root.total_time += interval_ms;
+
+            if max_depth == 0 {
+                root.self_time += interval_ms;
+                continue;
+            }
+
+            let mut node = &mut root;
+            let mut assigned_self_time = false;
+            for (included_depth, frame) in (1usize..).zip(
+                sample.stack[focus_index + 1..]
+                    .iter()
+                    .filter(|frame| include_frame(&frame.function_name)),
+            ) {
+                if included_depth >= max_depth {
+                    node.self_time += interval_ms;
+                    assigned_self_time = true;
+                    break;
+                }
+
+                node = node
+                    .children
+                    .entry(frame.function_name.clone())
+                    .or_insert_with(|| TreeBuilder::new(frame.function_name.clone()));
+                node.total_time += interval_ms;
+            }
+
+            if !assigned_self_time {
+                node.self_time += interval_ms;
+            }
+        }
+    }
+
+    if matched_samples == 0 {
+        return None;
+    }
+
+    let focused_time_ms = root.total_time;
+    let focused_percent = if total_thread_time > 0.0 {
+        focused_time_ms / total_thread_time * 100.0
+    } else {
+        0.0
+    };
+
+    Some(FocusedCallTree {
+        tree: root.into_node(focused_time_ms, total_thread_time, min_percent),
+        sample_count: matched_samples,
+        total_samples,
+        focused_time_ms,
+        focused_percent,
+    })
+}
+
+pub fn function_under_caller_index(
+    stack: &[ResolvedFrame],
+    function_name: &str,
+    caller_name: &str,
+    caller_relationship: CallerRelationship,
+) -> Option<usize> {
+    let mut first_match = None;
+
+    for (index, frame) in stack.iter().enumerate() {
+        if frame.function_name != function_name {
+            continue;
+        }
+
+        let has_caller = match caller_relationship {
+            CallerRelationship::Ancestor => stack[..index]
+                .iter()
+                .any(|frame| frame.function_name == caller_name),
+            CallerRelationship::Immediate => {
+                index > 0 && stack[index - 1].function_name == caller_name
+            }
+        };
+
+        if !has_caller {
+            continue;
+        }
+
+        if index + 1 == stack.len() {
+            return Some(index);
+        }
+
+        first_match.get_or_insert(index);
+    }
+
+    first_match
+}
+
+pub fn sample_interval_ms(thread: &ResolvedThread) -> f64 {
     if thread.samples.len() >= 2 {
         thread.duration_ms / (thread.samples.len() - 1) as f64
     } else {
@@ -373,5 +500,108 @@ mod tests {
         assert_eq!(focused.tree.function_name, "foo");
         assert_eq!(focused.tree.total_percent, 100.0);
         assert_eq!(focused.tree.children.len(), 2);
+    }
+
+    #[test]
+    fn function_under_caller_distinguishes_ancestor_and_immediate() {
+        let stack = vec![
+            make_frame("main"),
+            make_frame("finish_generation_status"),
+            make_frame("fluid_system"),
+            make_frame("WaterFluid::tick"),
+        ];
+
+        assert_eq!(
+            function_under_caller_index(
+                &stack,
+                "WaterFluid::tick",
+                "finish_generation_status",
+                CallerRelationship::Ancestor
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            function_under_caller_index(
+                &stack,
+                "WaterFluid::tick",
+                "finish_generation_status",
+                CallerRelationship::Immediate
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn focused_call_tree_can_be_scoped_to_a_caller() {
+        let thread = ResolvedThread {
+            name: "test".to_string(),
+            pid: "1".to_string(),
+            tid: "1".to_string(),
+            is_main: true,
+            duration_ms: 30.0,
+            markers: vec![],
+            samples: vec![
+                ResolvedSample {
+                    timestamp_ms: 0.0,
+                    weight: 1,
+                    cpu_delta_us: None,
+                    stack: vec![
+                        make_frame("main"),
+                        make_frame("finish_generation_status"),
+                        make_frame("WaterFluid::tick"),
+                        make_frame("child"),
+                    ],
+                },
+                ResolvedSample {
+                    timestamp_ms: 10.0,
+                    weight: 1,
+                    cpu_delta_us: None,
+                    stack: vec![
+                        make_frame("main"),
+                        make_frame("finish_generation_status"),
+                        make_frame("WaterFluid::tick"),
+                    ],
+                },
+                ResolvedSample {
+                    timestamp_ms: 20.0,
+                    weight: 1,
+                    cpu_delta_us: None,
+                    stack: vec![
+                        make_frame("main"),
+                        make_frame("other_status"),
+                        make_frame("WaterFluid::tick"),
+                    ],
+                },
+                ResolvedSample {
+                    timestamp_ms: 30.0,
+                    weight: 1,
+                    cpu_delta_us: None,
+                    stack: vec![
+                        make_frame("main"),
+                        make_frame("finish_generation_status"),
+                        make_frame("LavaFluid::tick"),
+                    ],
+                },
+            ],
+        };
+
+        let focused = build_focused_call_tree_under_caller_with_filter(
+            &[&thread],
+            "WaterFluid::tick",
+            "finish_generation_status",
+            CallerRelationship::Ancestor,
+            10,
+            0.0,
+            |_| true,
+        )
+        .unwrap();
+
+        assert_eq!(focused.sample_count, 2);
+        assert_eq!(focused.total_samples, 4);
+        assert_eq!(focused.focused_percent, 50.0);
+        assert_eq!(focused.tree.function_name, "WaterFluid::tick");
+        assert_eq!(focused.tree.self_time_ms, 10.0);
+        assert_eq!(focused.tree.children.len(), 1);
+        assert_eq!(focused.tree.children[0].function_name, "child");
     }
 }

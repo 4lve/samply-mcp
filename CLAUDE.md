@@ -24,6 +24,7 @@ src/
 │   ├── parse.rs         # Gzip decompression + JSON deserialization
 │   └── resolved.rs      # Denormalized profile with resolved index references
 └── analysis/
+    ├── symbols.rs      # Rust symbol IDs, compact display names, framework filters
     ├── functions.rs     # Per-function self-time / total-time aggregation
     ├── call_tree.rs     # Call tree construction + text rendering
     └── flamegraph.rs    # Brendan Gregg collapsed stack format
@@ -36,14 +37,16 @@ All tools require a `path` parameter pointing to a profile file. Profiles are lo
 - `profile_info` — metadata: duration, sample count, thread count, interval, categories (params: path)
 - `profile_threads` — list threads with stable `thread_index`/`tid`, names, sample counts, time ranges (params: path)
 - `profile_top_functions` — top N functions by self/total time with `function_id`, compact `display_name`, and source when available (params: path, thread/tid/thread_index, sort_by, limit, include, exclude, exclude_framework/user_code_only)
+- `profile_thread_group_top_functions` — top functions aggregated across thread name prefixes such as `rayon-gen-*` or `chunk-worker` (params: path, thread_name_prefix or thread_name_prefixes, sort_by, limit, include, exclude, exclude_framework/user_code_only)
 - `profile_search_functions` — find full symbol names and `function_id` values by substring (params: path, query, thread/tid/thread_index, match_mode, sort_by, limit, exclude_framework/user_code_only)
 - `profile_focus_function` — reroot stacks at one function and show both focus/thread percentages (params: path, query or function_id, thread/tid/thread_index, max_depth, min_percent, exclude_framework/user_code_only, short_names)
+- `profile_function_under_caller` — exclusive/descendant time for a function only under a specific caller/ancestor, optionally aggregated by thread name prefix (params: path, function_name/function_id, caller_name/caller_function_id, caller_mode, thread/tid/thread_index or thread_name_prefix, max_depth, min_percent, exclude_framework/user_code_only, short_names)
 - `profile_call_tree` — hierarchical call tree with time % and optional framework pruning (params: path, thread/tid/thread_index, max_depth, min_percent, exclude_framework/user_code_only, short_names)
 - `profile_function_detail` — callers/callees/source for one function, substring, or `function_id` (params: path, function_name or function_id, match_mode)
 - `profile_markers` — timeline markers/events (params: path, thread/tid/thread_index, limit)
 - `profile_flamegraph` — collapsed stack format text, optionally focused (params: path, thread/tid/thread_index, focus_function)
 
-Prefer `thread_index` or `tid` from `profile_threads` when selecting threads; profile thread names can repeat. Prefer `function_id` from search/top-function rows for follow-up calls with large Rust symbols. For Rust/Criterion profiles, use `exclude_framework: true` or `user_code_only: true` to prune criterion/std/core/alloc/libc/startup frames.
+Prefer `thread_index` or `tid` from `profile_threads` when selecting one thread; profile thread names can repeat. Use `profile_thread_group_top_functions` when CPU work is split across thread pools. Prefixes are starts-with matches, with a trailing `*` accepted for convenience. Prefer `function_id` from search/top-function rows for follow-up calls with large Rust symbols. For Rust/Criterion profiles, use `exclude_framework: true` or `user_code_only: true` to prune criterion/std/core/alloc/libc/startup frames.
 
 ## Usage
 

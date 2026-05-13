@@ -225,11 +225,31 @@ fn resolve_function_name(
     match_mode: &str,
     thread_index: Option<usize>,
 ) -> Option<String> {
+    if let Some(thread_index) = thread_index {
+        return resolve_function_name_in_threads(
+            stats_by_thread,
+            query,
+            function_id,
+            match_mode,
+            Some(&[thread_index]),
+        );
+    }
+
+    resolve_function_name_in_threads(stats_by_thread, query, function_id, match_mode, None)
+}
+
+fn resolve_function_name_in_threads(
+    stats_by_thread: &[Vec<FunctionStats>],
+    query: Option<&str>,
+    function_id: Option<&str>,
+    match_mode: &str,
+    thread_indices: Option<&[usize]>,
+) -> Option<String> {
     if let Some(function_id) = function_id {
         return stats_by_thread
             .iter()
             .enumerate()
-            .filter(|(index, _)| thread_index.is_none_or(|selected| selected == *index))
+            .filter(|(index, _)| thread_indices.is_none_or(|selected| selected.contains(index)))
             .flat_map(|(_, stats)| stats.iter())
             .find(|stats| symbols::function_id(&stats.name) == function_id)
             .map(|stats| stats.name.clone());
@@ -239,7 +259,7 @@ fn resolve_function_name(
     let stats_iter = stats_by_thread
         .iter()
         .enumerate()
-        .filter(|(index, _)| thread_index.is_none_or(|selected| selected == *index))
+        .filter(|(index, _)| thread_indices.is_none_or(|selected| selected.contains(index)))
         .flat_map(|(_, stats)| stats.iter());
 
     let mut candidates: Vec<&FunctionStats> = stats_iter
@@ -264,6 +284,286 @@ fn source_location(file: &Option<String>, line: Option<u32>) -> Option<String> {
 
 fn exclude_framework_enabled(exclude_framework: bool, user_code_only: bool) -> bool {
     exclude_framework || user_code_only
+}
+
+fn requested_thread_prefixes(
+    thread_name_prefix: &Option<String>,
+    thread_name_prefixes: &[String],
+) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    if let Some(prefix) = thread_name_prefix {
+        let prefix = prefix.trim();
+        if !prefix.is_empty() {
+            prefixes.push(prefix.to_string());
+        }
+    }
+
+    for prefix in thread_name_prefixes {
+        let prefix = prefix.trim();
+        if !prefix.is_empty() && !prefixes.iter().any(|existing| existing == prefix) {
+            prefixes.push(prefix.to_string());
+        }
+    }
+
+    prefixes
+}
+
+fn normalized_thread_prefix(prefix: &str) -> String {
+    prefix
+        .trim()
+        .strip_suffix('*')
+        .unwrap_or(prefix.trim())
+        .to_string()
+}
+
+fn thread_name_matches_prefix(thread_name: &str, prefix: &str) -> bool {
+    thread_name.starts_with(&normalized_thread_prefix(prefix))
+}
+
+fn thread_infos(profile: &ResolvedProfile, thread_indices: &[usize]) -> Vec<ThreadInfo> {
+    thread_indices
+        .iter()
+        .filter_map(|index| profile.threads.get(*index).map(|thread| (*index, thread)))
+        .map(|(index, thread)| ThreadInfo {
+            index,
+            name: thread.name.clone(),
+            pid: thread.pid.clone(),
+            tid: thread.tid.clone(),
+            sample_count: thread.samples.len(),
+            duration_ms: thread.duration_ms,
+            is_main: thread.is_main,
+        })
+        .collect()
+}
+
+fn scope_total_time_ms(profile: &ResolvedProfile, thread_indices: &[usize]) -> f64 {
+    thread_indices
+        .iter()
+        .filter_map(|index| profile.threads.get(*index))
+        .map(|thread| call_tree::sample_interval_ms(thread) * thread.samples.len() as f64)
+        .sum()
+}
+
+fn aggregate_function_stats(
+    cached: &CachedProfile,
+    thread_indices: &[usize],
+) -> (Vec<FunctionStats>, f64, usize) {
+    let total_time_ms = scope_total_time_ms(&cached.profile, thread_indices);
+    let total_samples = thread_indices
+        .iter()
+        .filter_map(|index| cached.profile.threads.get(*index))
+        .map(|thread| thread.samples.len())
+        .sum();
+
+    let mut by_name: HashMap<String, AggregatedFunctionStatsAccum> = HashMap::new();
+
+    for index in thread_indices {
+        let Some(stats) = cached.cache.function_stats.get(*index) else {
+            continue;
+        };
+
+        for stat in stats {
+            let entry = by_name.entry(stat.name.clone()).or_default();
+            entry.self_time_ms += stat.self_time_ms;
+            entry.total_time_ms += stat.total_time_ms;
+            entry.sample_count += stat.sample_count;
+            if entry.library.is_none() {
+                entry.library = stat.library.clone();
+            }
+            if entry.file.is_none() {
+                entry.file = stat.file.clone();
+            }
+            if entry.line.is_none() {
+                entry.line = stat.line;
+            }
+        }
+    }
+
+    let mut stats: Vec<FunctionStats> = by_name
+        .into_iter()
+        .map(|(name, acc)| FunctionStats {
+            name,
+            self_time_ms: acc.self_time_ms,
+            total_time_ms: acc.total_time_ms,
+            self_percent: percent(acc.self_time_ms, total_time_ms),
+            total_percent: percent(acc.total_time_ms, total_time_ms),
+            sample_count: acc.sample_count,
+            library: acc.library,
+            file: acc.file,
+            line: acc.line,
+        })
+        .collect();
+    sort_function_stats(&mut stats, "self");
+
+    (stats, total_time_ms, total_samples)
+}
+
+#[derive(Default)]
+struct AggregatedFunctionStatsAccum {
+    self_time_ms: f64,
+    total_time_ms: f64,
+    sample_count: usize,
+    library: Option<String>,
+    file: Option<String>,
+    line: Option<u32>,
+}
+
+fn select_thread_indices_for_scope(
+    profile: &ResolvedProfile,
+    thread: &Option<String>,
+    tid: &Option<String>,
+    thread_index: Option<usize>,
+    thread_name_prefix: &Option<String>,
+    thread_name_prefixes: &[String],
+) -> Result<(String, Vec<usize>), String> {
+    let prefixes = requested_thread_prefixes(thread_name_prefix, thread_name_prefixes);
+    let has_explicit_thread_selector = thread.is_some() || tid.is_some() || thread_index.is_some();
+
+    if has_explicit_thread_selector && !prefixes.is_empty() {
+        return Err(
+            "Use either thread/tid/thread_index or thread_name_prefix, not both".to_string(),
+        );
+    }
+
+    if has_explicit_thread_selector {
+        let selected = select_thread(profile, thread, tid, thread_index)?;
+        return Ok((
+            thread_label(selected.index, selected.thread),
+            vec![selected.index],
+        ));
+    }
+
+    if !prefixes.is_empty() {
+        let mut indices = Vec::new();
+        for (index, thread) in profile.threads.iter().enumerate() {
+            if prefixes
+                .iter()
+                .any(|prefix| thread_name_matches_prefix(&thread.name, prefix))
+            {
+                indices.push(index);
+            }
+        }
+
+        if indices.is_empty() {
+            return Err(format!(
+                "No threads matched prefix(es): {}",
+                prefixes.join(", ")
+            ));
+        }
+
+        return Ok((
+            format!("thread prefix(es): {}", prefixes.join(", ")),
+            indices,
+        ));
+    }
+
+    let indices: Vec<usize> = profile
+        .threads
+        .iter()
+        .enumerate()
+        .filter(|(_, thread)| !thread.samples.is_empty())
+        .map(|(index, _)| index)
+        .collect();
+
+    if indices.is_empty() {
+        return Err("No sampled threads found".to_string());
+    }
+
+    Ok(("all sampled threads".to_string(), indices))
+}
+
+fn parse_caller_relationship(value: &str) -> Result<call_tree::CallerRelationship, String> {
+    match value.trim().to_lowercase().as_str() {
+        "ancestor" => Ok(call_tree::CallerRelationship::Ancestor),
+        "immediate" => Ok(call_tree::CallerRelationship::Immediate),
+        _ => Err("caller_mode must be 'ancestor' or 'immediate'".to_string()),
+    }
+}
+
+fn caller_relationship_label(value: call_tree::CallerRelationship) -> &'static str {
+    match value {
+        call_tree::CallerRelationship::Ancestor => "ancestor",
+        call_tree::CallerRelationship::Immediate => "immediate",
+    }
+}
+
+#[derive(Debug, Default)]
+struct FunctionUnderCallerMetrics {
+    exclusive_time_ms: f64,
+    descendant_time_ms: f64,
+    caller_context_time_ms: f64,
+    scope_time_ms: f64,
+    exclusive_samples: usize,
+    descendant_samples: usize,
+    caller_context_samples: usize,
+    total_scope_samples: usize,
+    matched_thread_indices: Vec<usize>,
+}
+
+fn compute_function_under_caller_metrics(
+    profile: &ResolvedProfile,
+    thread_indices: &[usize],
+    function_name: &str,
+    caller_name: &str,
+    caller_relationship: call_tree::CallerRelationship,
+) -> FunctionUnderCallerMetrics {
+    let mut metrics = FunctionUnderCallerMetrics {
+        scope_time_ms: scope_total_time_ms(profile, thread_indices),
+        ..Default::default()
+    };
+
+    for index in thread_indices {
+        let Some(thread) = profile.threads.get(*index) else {
+            continue;
+        };
+        let interval_ms = call_tree::sample_interval_ms(thread);
+        let mut thread_matched = false;
+
+        for sample in &thread.samples {
+            metrics.total_scope_samples += 1;
+
+            if sample
+                .stack
+                .iter()
+                .any(|frame| frame.function_name == caller_name)
+            {
+                metrics.caller_context_time_ms += interval_ms;
+                metrics.caller_context_samples += 1;
+            }
+
+            let Some(function_index) = call_tree::function_under_caller_index(
+                &sample.stack,
+                function_name,
+                caller_name,
+                caller_relationship,
+            ) else {
+                continue;
+            };
+
+            metrics.descendant_time_ms += interval_ms;
+            metrics.descendant_samples += 1;
+            thread_matched = true;
+
+            if function_index + 1 == sample.stack.len() {
+                metrics.exclusive_time_ms += interval_ms;
+                metrics.exclusive_samples += 1;
+            }
+        }
+
+        if thread_matched {
+            metrics.matched_thread_indices.push(*index);
+        }
+    }
+
+    metrics
+}
+
+fn percent(numerator: f64, denominator: f64) -> f64 {
+    if denominator > 0.0 {
+        numerator / denominator * 100.0
+    } else {
+        0.0
+    }
 }
 
 // ── Request types ──
@@ -308,6 +608,54 @@ pub struct TopFunctionsRequest {
     pub sort_by: String,
 
     #[schemars(description = "Maximum number of functions to return (default: 20)")]
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+
+    #[schemars(
+        description = "Optional case-insensitive include filter. Use '|' to separate alternatives."
+    )]
+    #[serde(default)]
+    pub include: Option<String>,
+
+    #[schemars(
+        description = "Optional case-insensitive exclude filter. Use '|' to separate alternatives."
+    )]
+    #[serde(default)]
+    pub exclude: Option<String>,
+
+    #[schemars(
+        description = "Exclude framework/runtime frames such as criterion, std/core/alloc, libc, and raw addresses"
+    )]
+    #[serde(default)]
+    pub exclude_framework: bool,
+
+    #[schemars(description = "Alias for exclude_framework")]
+    #[serde(default)]
+    pub user_code_only: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ThreadGroupTopFunctionsRequest {
+    #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
+    pub path: String,
+
+    #[schemars(
+        description = "Thread name prefix to aggregate. A trailing '*' is accepted, e.g. rayon-gen-* matches names starting with rayon-gen-."
+    )]
+    #[serde(default)]
+    pub thread_name_prefix: Option<String>,
+
+    #[schemars(
+        description = "Thread name prefixes to aggregate into separate groups. A trailing '*' is accepted for prefix-style globs."
+    )]
+    #[serde(default)]
+    pub thread_name_prefixes: Vec<String>,
+
+    #[schemars(description = "Sort by 'self' (default) or 'total' time")]
+    #[serde(default = "default_sort_by")]
+    pub sort_by: String,
+
+    #[schemars(description = "Maximum number of functions per group to return (default: 20)")]
     #[serde(default = "default_limit")]
     pub limit: usize,
 
@@ -611,6 +959,98 @@ pub struct FocusFunctionRequest {
     pub short_names: bool,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FunctionUnderCallerRequest {
+    #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
+    pub path: String,
+
+    #[schemars(description = "Full function name or substring for the function being measured")]
+    #[serde(default)]
+    pub function_name: Option<String>,
+
+    #[schemars(
+        description = "Stable function id for the function being measured, returned by profile_search_functions or profile_top_functions"
+    )]
+    #[serde(default)]
+    pub function_id: Option<String>,
+
+    #[schemars(description = "Full caller/ancestor function name or substring")]
+    #[serde(default)]
+    pub caller_name: Option<String>,
+
+    #[schemars(
+        description = "Stable function id for the caller/ancestor, returned by profile_search_functions or profile_top_functions"
+    )]
+    #[serde(default)]
+    pub caller_function_id: Option<String>,
+
+    #[schemars(description = "Match mode for function_name: 'contains' (default) or 'exact'")]
+    #[serde(default = "default_match_mode")]
+    pub match_mode: String,
+
+    #[schemars(description = "Match mode for caller_name: 'contains' (default) or 'exact'")]
+    #[serde(default = "default_match_mode")]
+    pub caller_match_mode: String,
+
+    #[schemars(
+        description = "Caller relationship: 'ancestor' (default) allows any parent frame; 'immediate' requires the direct caller"
+    )]
+    #[serde(default = "default_caller_mode")]
+    pub caller_mode: String,
+
+    #[schemars(
+        description = "Thread name. If multiple threads have this name, the one with the most samples is used."
+    )]
+    #[serde(default)]
+    pub thread: Option<String>,
+
+    #[schemars(description = "Thread id. Prefer this when profile_threads shows duplicate names.")]
+    #[serde(default)]
+    pub tid: Option<String>,
+
+    #[schemars(description = "Zero-based thread index from profile_threads.")]
+    #[serde(default)]
+    pub thread_index: Option<usize>,
+
+    #[schemars(
+        description = "Thread name prefix to aggregate before measuring. A trailing '*' is accepted, e.g. chunk-worker*."
+    )]
+    #[serde(default)]
+    pub thread_name_prefix: Option<String>,
+
+    #[schemars(
+        description = "Thread name prefixes to aggregate before measuring. A trailing '*' is accepted for prefix-style globs."
+    )]
+    #[serde(default)]
+    pub thread_name_prefixes: Vec<String>,
+
+    #[schemars(description = "Maximum depth of the returned descendant tree (default: 10)")]
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
+
+    #[schemars(description = "Minimum focused percentage to include a tree node (default: 1.0)")]
+    #[serde(default = "default_min_percent")]
+    pub min_percent: f64,
+
+    #[schemars(
+        description = "Exclude framework/runtime frames such as criterion, std/core/alloc, libc, and raw addresses"
+    )]
+    #[serde(default)]
+    pub exclude_framework: bool,
+
+    #[schemars(description = "Alias for exclude_framework")]
+    #[serde(default)]
+    pub user_code_only: bool,
+
+    #[schemars(description = "Use compact Rust display names in the rendered tree")]
+    #[serde(default = "default_short_names")]
+    pub short_names: bool,
+}
+
+fn default_caller_mode() -> String {
+    "ancestor".to_string()
+}
+
 // ── Response types ──
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -661,6 +1101,23 @@ pub struct TopFunctionsResult {
     pub tid: String,
     pub thread_index: usize,
     pub sort_by: String,
+    pub functions: Vec<FunctionRow>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ThreadGroupTopFunctionsResult {
+    pub groups: Vec<ThreadGroupTopFunctionsGroup>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ThreadGroupTopFunctionsGroup {
+    pub thread_name_prefix: String,
+    pub normalized_thread_name_prefix: String,
+    pub thread_count: usize,
+    pub sample_count: usize,
+    pub total_time_ms: f64,
+    pub sort_by: String,
+    pub threads: Vec<ThreadInfo>,
     pub functions: Vec<FunctionRow>,
 }
 
@@ -768,6 +1225,34 @@ pub struct FocusFunctionResult {
     pub tree: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FunctionUnderCallerResult {
+    pub scope: String,
+    pub thread_count: usize,
+    pub threads: Vec<ThreadInfo>,
+    pub matched_threads: Vec<ThreadInfo>,
+    pub function_id: String,
+    pub function_name: String,
+    pub display_name: String,
+    pub caller_function_id: String,
+    pub caller_function_name: String,
+    pub caller_display_name: String,
+    pub caller_mode: String,
+    pub exclusive_time_ms: f64,
+    pub descendant_time_ms: f64,
+    pub caller_context_time_ms: f64,
+    pub scope_time_ms: f64,
+    pub exclusive_percent_of_scope: f64,
+    pub descendant_percent_of_scope: f64,
+    pub caller_context_percent_of_scope: f64,
+    pub descendant_percent_of_caller: f64,
+    pub exclusive_samples: usize,
+    pub descendant_samples: usize,
+    pub caller_context_samples: usize,
+    pub total_scope_samples: usize,
+    pub tree: String,
+}
+
 // ── Tool implementations ──
 
 #[tool_router]
@@ -869,6 +1354,88 @@ impl ProfileServer {
             sort_by: req.sort_by,
             functions,
         }))
+    }
+
+    #[tool(
+        description = "Aggregate top functions across groups of threads selected by name prefix, e.g. rayon-gen-* or chunk-worker."
+    )]
+    fn profile_thread_group_top_functions(
+        &self,
+        Parameters(req): Parameters<ThreadGroupTopFunctionsRequest>,
+    ) -> Result<Json<ThreadGroupTopFunctionsResult>, String> {
+        let cached = self.get_profile(&req.path)?;
+        let prefixes =
+            requested_thread_prefixes(&req.thread_name_prefix, &req.thread_name_prefixes);
+
+        if prefixes.is_empty() {
+            return Err(
+                "Provide thread_name_prefix or thread_name_prefixes, e.g. rayon-gen-*".to_string(),
+            );
+        }
+
+        let exclude_framework =
+            exclude_framework_enabled(req.exclude_framework, req.user_code_only);
+        let mut groups = Vec::new();
+        let mut matched_any = false;
+
+        for prefix in prefixes {
+            let normalized_prefix = normalized_thread_prefix(&prefix);
+            let thread_indices: Vec<usize> = cached
+                .profile
+                .threads
+                .iter()
+                .enumerate()
+                .filter(|(_, thread)| thread.name.starts_with(&normalized_prefix))
+                .map(|(index, _)| index)
+                .collect();
+
+            if !thread_indices.is_empty() {
+                matched_any = true;
+            }
+
+            let (mut stats, total_time_ms, sample_count) =
+                aggregate_function_stats(&cached, &thread_indices);
+            sort_function_stats(&mut stats, &req.sort_by);
+
+            let functions = stats
+                .into_iter()
+                .filter(|s| {
+                    function_passes_filters(s, &req.include, &req.exclude, exclude_framework)
+                })
+                .take(req.limit)
+                .map(|s| FunctionRow {
+                    function_id: symbols::function_id(&s.name),
+                    display_name: symbols::compact_function_name(&s.name),
+                    source: source_location(&s.file, s.line),
+                    name: s.name,
+                    self_percent: round2(s.self_percent),
+                    total_percent: round2(s.total_percent),
+                    self_time_ms: round2(s.self_time_ms),
+                    total_time_ms: round2(s.total_time_ms),
+                    sample_count: s.sample_count,
+                    library: s.library,
+                    file: s.file,
+                    line: s.line,
+                })
+                .collect();
+
+            groups.push(ThreadGroupTopFunctionsGroup {
+                thread_name_prefix: prefix,
+                normalized_thread_name_prefix: normalized_prefix,
+                thread_count: thread_indices.len(),
+                sample_count,
+                total_time_ms: round2(total_time_ms),
+                sort_by: req.sort_by.clone(),
+                threads: thread_infos(&cached.profile, &thread_indices),
+                functions,
+            });
+        }
+
+        if !matched_any {
+            return Err("No threads matched the requested prefix group(s)".to_string());
+        }
+
+        Ok(Json(ThreadGroupTopFunctionsResult { groups }))
     }
 
     #[tool(
@@ -1156,6 +1723,127 @@ impl ProfileServer {
     }
 
     #[tool(
+        description = "Measure a function only when it appears under a specific caller/ancestor, including exclusive and descendant time. Can aggregate across thread name prefixes."
+    )]
+    fn profile_function_under_caller(
+        &self,
+        Parameters(req): Parameters<FunctionUnderCallerRequest>,
+    ) -> Result<Json<FunctionUnderCallerResult>, String> {
+        let cached = self.get_profile(&req.path)?;
+        let profile = &cached.profile;
+        let (scope, thread_indices) = select_thread_indices_for_scope(
+            profile,
+            &req.thread,
+            &req.tid,
+            req.thread_index,
+            &req.thread_name_prefix,
+            &req.thread_name_prefixes,
+        )?;
+        let caller_relationship = parse_caller_relationship(&req.caller_mode)?;
+
+        let function_name = resolve_function_name_in_threads(
+            &cached.cache.function_stats,
+            req.function_name.as_deref(),
+            req.function_id.as_deref(),
+            &req.match_mode,
+            Some(&thread_indices),
+        )
+        .ok_or_else(|| {
+            "Function not found in selected thread scope. Provide function_id or function_name; try profile_search_functions first.".to_string()
+        })?;
+
+        let caller_name = resolve_function_name_in_threads(
+            &cached.cache.function_stats,
+            req.caller_name.as_deref(),
+            req.caller_function_id.as_deref(),
+            &req.caller_match_mode,
+            Some(&thread_indices),
+        )
+        .ok_or_else(|| {
+            "Caller function not found in selected thread scope. Provide caller_function_id or caller_name; try profile_search_functions first.".to_string()
+        })?;
+
+        let metrics = compute_function_under_caller_metrics(
+            profile,
+            &thread_indices,
+            &function_name,
+            &caller_name,
+            caller_relationship,
+        );
+
+        if metrics.descendant_samples == 0 {
+            return Err(format!(
+                "Function '{}' did not appear under caller '{}' in scope {}",
+                function_name, caller_name, scope
+            ));
+        }
+
+        let thread_refs: Vec<&ResolvedThread> = thread_indices
+            .iter()
+            .filter_map(|index| profile.threads.get(*index))
+            .collect();
+        let exclude_framework =
+            exclude_framework_enabled(req.exclude_framework, req.user_code_only);
+        let focused = call_tree::build_focused_call_tree_under_caller_with_filter(
+            &thread_refs,
+            &function_name,
+            &caller_name,
+            caller_relationship,
+            req.max_depth,
+            req.min_percent,
+            |name| !exclude_framework || !symbols::is_framework_function(name, None),
+        )
+        .ok_or_else(|| {
+            format!(
+                "Function '{}' did not appear under caller '{}' in scope {}",
+                function_name, caller_name, scope
+            )
+        })?;
+        let tree = focused
+            .tree
+            .render_text_with_options(req.max_depth, req.short_names, true);
+
+        Ok(Json(FunctionUnderCallerResult {
+            scope,
+            thread_count: thread_indices.len(),
+            threads: thread_infos(profile, &thread_indices),
+            matched_threads: thread_infos(profile, &metrics.matched_thread_indices),
+            function_id: symbols::function_id(&function_name),
+            display_name: symbols::compact_function_name(&function_name),
+            function_name,
+            caller_function_id: symbols::function_id(&caller_name),
+            caller_display_name: symbols::compact_function_name(&caller_name),
+            caller_function_name: caller_name,
+            caller_mode: caller_relationship_label(caller_relationship).to_string(),
+            exclusive_time_ms: round2(metrics.exclusive_time_ms),
+            descendant_time_ms: round2(metrics.descendant_time_ms),
+            caller_context_time_ms: round2(metrics.caller_context_time_ms),
+            scope_time_ms: round2(metrics.scope_time_ms),
+            exclusive_percent_of_scope: round2(percent(
+                metrics.exclusive_time_ms,
+                metrics.scope_time_ms,
+            )),
+            descendant_percent_of_scope: round2(percent(
+                metrics.descendant_time_ms,
+                metrics.scope_time_ms,
+            )),
+            caller_context_percent_of_scope: round2(percent(
+                metrics.caller_context_time_ms,
+                metrics.scope_time_ms,
+            )),
+            descendant_percent_of_caller: round2(percent(
+                metrics.descendant_time_ms,
+                metrics.caller_context_time_ms,
+            )),
+            exclusive_samples: metrics.exclusive_samples,
+            descendant_samples: metrics.descendant_samples,
+            caller_context_samples: metrics.caller_context_samples,
+            total_scope_samples: metrics.total_scope_samples,
+            tree,
+        }))
+    }
+
+    #[tool(
         description = "Get timeline markers/events for a thread, including their timing, category, and associated data"
     )]
     fn profile_markers(
@@ -1276,8 +1964,12 @@ impl ServerHandler for ProfileServer {
                  from profile_threads when selecting a thread, because thread names can repeat. \
                  Use profile_top_functions to find CPU hotspots, profile_search_functions to \
                  find full Rust symbol names and stable function_id values from short substrings, \
+                 profile_thread_group_top_functions to aggregate hotspots across thread name \
+                 prefixes such as rayon-gen-* or chunk-worker, \
                  profile_focus_function to reroot stacks at a function with percentages scaled \
-                 to matching samples, profile_call_tree for full hierarchical call analysis, \
+                 to matching samples, profile_function_under_caller for exclusive/descendant \
+                 time when a function appears under a specific caller/ancestor, \
+                 profile_call_tree for full hierarchical call analysis, \
                  profile_function_detail for callers/callees, profile_markers for timeline \
                  events, and profile_flamegraph for collapsed stack output. Prefer \
                  exclude_framework=true or user_code_only=true for Rust/Criterion profiles. \
