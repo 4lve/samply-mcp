@@ -123,6 +123,7 @@ fn resolve_thread(
     let func_count = thread.func_table.length;
     let mut func_names: Vec<String> = Vec::with_capacity(func_count);
     let mut func_files: Vec<Option<String>> = Vec::with_capacity(func_count);
+    let mut func_lines: Vec<Option<u32>> = Vec::with_capacity(func_count);
     let mut func_resource: Vec<Option<usize>> = Vec::with_capacity(func_count);
 
     for i in 0..func_count {
@@ -135,6 +136,13 @@ fn resolve_thread(
             .and_then(|f| f.get(i).copied().flatten())
             .map(&str_at);
         func_files.push(file);
+
+        let line = thread
+            .func_table
+            .line_number
+            .as_ref()
+            .and_then(|l| l.get(i).copied().flatten());
+        func_lines.push(line);
 
         let res = thread.func_table.resource.as_ref().and_then(|r| {
             r.get(i).and_then(|v| match v {
@@ -196,7 +204,7 @@ fn resolve_thread(
                 let frame = ResolvedFrame {
                     function_name: func_names.get(fi).cloned().unwrap_or_default(),
                     file: func_files.get(fi).cloned().flatten(),
-                    line: frame_line[frame_idx],
+                    line: frame_line[frame_idx].or_else(|| func_lines.get(fi).copied().flatten()),
                     category: frame_category[frame_idx].clone(),
                     library: func_resource
                         .get(fi)

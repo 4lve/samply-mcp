@@ -18,7 +18,7 @@ Both `cargo fmt --check` and `cargo clippy -- -D warnings` must pass with zero w
 src/
 ├── main.rs              # Entry point, CLI dispatch (tokio async)
 ├── cli.rs               # Clap command definitions
-├── mcp.rs               # MCP server (rmcp), tool router, all 7 tool handlers
+├── mcp.rs               # MCP server (rmcp), tool router, all tool handlers
 ├── profile/
 │   ├── types.rs         # Serde types for Firefox Profiler JSON
 │   ├── parse.rs         # Gzip decompression + JSON deserialization
@@ -34,12 +34,16 @@ src/
 All tools require a `path` parameter pointing to a profile file. Profiles are loaded on-demand and cached in memory.
 
 - `profile_info` — metadata: duration, sample count, thread count, interval, categories (params: path)
-- `profile_threads` — list threads with names, sample counts, time ranges (params: path)
-- `profile_top_functions` — top N functions by self/total time (params: path, thread, sort_by, limit)
-- `profile_call_tree` — hierarchical call tree with time % (params: path, thread, depth, min_percent)
-- `profile_function_detail` — callers/callees/source for one function (params: path, function_name)
-- `profile_markers` — timeline markers/events (params: path, thread, limit)
-- `profile_flamegraph` — collapsed stack format text (params: path, thread)
+- `profile_threads` — list threads with stable `thread_index`/`tid`, names, sample counts, time ranges (params: path)
+- `profile_top_functions` — top N functions by self/total time with `function_id`, compact `display_name`, and source when available (params: path, thread/tid/thread_index, sort_by, limit, include, exclude, exclude_framework/user_code_only)
+- `profile_search_functions` — find full symbol names and `function_id` values by substring (params: path, query, thread/tid/thread_index, match_mode, sort_by, limit, exclude_framework/user_code_only)
+- `profile_focus_function` — reroot stacks at one function and show both focus/thread percentages (params: path, query or function_id, thread/tid/thread_index, max_depth, min_percent, exclude_framework/user_code_only, short_names)
+- `profile_call_tree` — hierarchical call tree with time % and optional framework pruning (params: path, thread/tid/thread_index, max_depth, min_percent, exclude_framework/user_code_only, short_names)
+- `profile_function_detail` — callers/callees/source for one function, substring, or `function_id` (params: path, function_name or function_id, match_mode)
+- `profile_markers` — timeline markers/events (params: path, thread/tid/thread_index, limit)
+- `profile_flamegraph` — collapsed stack format text, optionally focused (params: path, thread/tid/thread_index, focus_function)
+
+Prefer `thread_index` or `tid` from `profile_threads` when selecting threads; profile thread names can repeat. Prefer `function_id` from search/top-function rows for follow-up calls with large Rust symbols. For Rust/Criterion profiles, use `exclude_framework: true` or `user_code_only: true` to prune criterion/std/core/alloc/libc/startup frames.
 
 ## Usage
 

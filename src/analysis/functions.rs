@@ -76,7 +76,7 @@ pub fn compute_function_stats(thread: &ResolvedThread) -> Vec<FunctionStats> {
         })
         .collect();
 
-    result.sort_by(|a, b| b.self_time_ms.partial_cmp(&a.self_time_ms).unwrap());
+    result.sort_by(|a, b| b.self_time_ms.total_cmp(&a.self_time_ms));
     result
 }
 

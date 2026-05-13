@@ -22,14 +22,20 @@ Every tool accepts a `path` parameter, so one server installation works for any 
 | Tool | Description |
 |------|-------------|
 | `profile_info` | Profile metadata: duration, sample count, thread count, sampling interval |
-| `profile_threads` | List all threads with names, sample counts, and time ranges |
-| `profile_top_functions` | Top N functions by self-time or total-time |
-| `profile_call_tree` | Hierarchical call tree with time percentages |
+| `profile_threads` | List all threads with stable `thread_index`/`tid`, names, sample counts, and time ranges |
+| `profile_top_functions` | Top N functions by self-time or total-time, with stable `function_id`, compact `display_name`, and source when available |
+| `profile_search_functions` | Find full symbol names and `function_id` values by substring, with per-thread timing |
+| `profile_focus_function` | Reroot stacks at a function and show both focused and thread-level percentages |
+| `profile_call_tree` | Hierarchical call tree with optional `exclude_framework`/`user_code_only` pruning |
 | `profile_function_detail` | Callers, callees, and source locations for a specific function |
 | `profile_markers` | Timeline markers and events |
-| `profile_flamegraph` | Collapsed stack format (Brendan Gregg) for generating flamegraphs |
+| `profile_flamegraph` | Collapsed stack format, optionally sliced from a focused function |
 
 All tools require a `path` parameter pointing to a profile `.json` or `.json.gz` file. Profiles are loaded on first use and cached in memory.
+
+Thread names can repeat in multi-process profiles. Prefer `thread_index` or `tid` from `profile_threads` when calling thread-scoped tools. Function-focused tools accept short substrings, and search/top-function rows return a stable `function_id` so follow-up calls do not need to pass huge monomorphized Rust symbols.
+
+For Rust or Criterion profiles, pass `exclude_framework: true` or `user_code_only: true` to prune common runtime/framework frames such as `criterion`, `std`, `core`, `alloc`, `libc`, raw addresses, and startup frames. Focused call trees report nodes as `X% focus / Y% thread` to avoid mistaking a small focused subset for a large whole-profile cost.
 
 ## Recording a Profile
 

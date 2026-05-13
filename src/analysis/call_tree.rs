@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::analysis::symbols;
 use crate::profile::resolved::ResolvedThread;
 
 #[derive(Debug, Clone)]
@@ -8,28 +9,30 @@ pub struct CallTreeNode {
     pub self_time_ms: f64,
     pub total_time_ms: f64,
     pub total_percent: f64,
+    pub thread_percent: f64,
     pub children: Vec<CallTreeNode>,
 }
 
-pub fn build_call_tree(
+#[derive(Debug, Clone)]
+pub struct FocusedCallTree {
+    pub tree: CallTreeNode,
+    pub sample_count: usize,
+    pub total_samples: usize,
+    pub focused_time_ms: f64,
+    pub focused_percent: f64,
+}
+
+pub fn build_call_tree_with_filter(
     thread: &ResolvedThread,
     max_depth: usize,
     min_percent: f64,
+    mut include_frame: impl FnMut(&str) -> bool,
 ) -> CallTreeNode {
-    let interval_ms = if thread.samples.len() >= 2 {
-        thread.duration_ms / (thread.samples.len() - 1) as f64
-    } else {
-        1.0
-    };
+    let interval_ms = sample_interval_ms(thread);
 
     let total_time = interval_ms * thread.samples.len() as f64;
 
-    let mut root = TreeBuilder {
-        name: "(root)".to_string(),
-        self_time: 0.0,
-        total_time: 0.0,
-        children: HashMap::new(),
-    };
+    let mut root = TreeBuilder::new("(root)".to_string());
 
     for sample in &thread.samples {
         if sample.stack.is_empty() {
@@ -40,33 +43,119 @@ pub fn build_call_tree(
 
         root.total_time += interval_ms;
         let mut node = &mut root;
+        let mut assigned_self_time = false;
 
-        for (depth, frame) in sample.stack.iter().enumerate() {
-            if depth >= max_depth {
+        for (included_depth, frame) in sample
+            .stack
+            .iter()
+            .filter(|frame| include_frame(&frame.function_name))
+            .enumerate()
+        {
+            if included_depth >= max_depth {
                 // Attribute remaining time as self-time of the deepest node
                 node.self_time += interval_ms;
+                assigned_self_time = true;
                 break;
             }
 
             node = node
                 .children
                 .entry(frame.function_name.clone())
-                .or_insert_with(|| TreeBuilder {
-                    name: frame.function_name.clone(),
-                    self_time: 0.0,
-                    total_time: 0.0,
-                    children: HashMap::new(),
-                });
+                .or_insert_with(|| TreeBuilder::new(frame.function_name.clone()));
             node.total_time += interval_ms;
 
-            // If this is the leaf, attribute self-time
-            if depth == sample.stack.len() - 1 {
-                node.self_time += interval_ms;
-            }
+            // Leaf self-time is assigned after filtering below.
+        }
+
+        if !assigned_self_time {
+            node.self_time += interval_ms;
         }
     }
 
-    root.into_node(total_time, min_percent)
+    root.into_node(total_time, total_time, min_percent)
+}
+
+pub fn build_focused_call_tree_with_filter(
+    thread: &ResolvedThread,
+    function_name: &str,
+    max_depth: usize,
+    min_percent: f64,
+    mut include_frame: impl FnMut(&str) -> bool,
+) -> Option<FocusedCallTree> {
+    let interval_ms = sample_interval_ms(thread);
+    let total_thread_time = interval_ms * thread.samples.len() as f64;
+
+    let mut root = TreeBuilder::new(function_name.to_string());
+    let mut matched_samples = 0usize;
+
+    for sample in &thread.samples {
+        let Some(focus_index) = sample
+            .stack
+            .iter()
+            .position(|frame| frame.function_name == function_name)
+        else {
+            continue;
+        };
+
+        matched_samples += 1;
+        root.total_time += interval_ms;
+
+        if max_depth == 0 {
+            root.self_time += interval_ms;
+            continue;
+        }
+
+        let mut node = &mut root;
+        let mut assigned_self_time = false;
+        for (included_depth, frame) in (1usize..).zip(
+            sample.stack[focus_index + 1..]
+                .iter()
+                .filter(|frame| include_frame(&frame.function_name)),
+        ) {
+            if included_depth >= max_depth {
+                node.self_time += interval_ms;
+                assigned_self_time = true;
+                break;
+            }
+
+            node = node
+                .children
+                .entry(frame.function_name.clone())
+                .or_insert_with(|| TreeBuilder::new(frame.function_name.clone()));
+            node.total_time += interval_ms;
+        }
+
+        if !assigned_self_time {
+            node.self_time += interval_ms;
+        }
+    }
+
+    if matched_samples == 0 {
+        return None;
+    }
+
+    let focused_time_ms = interval_ms * matched_samples as f64;
+    let focused_percent = if total_thread_time > 0.0 {
+        focused_time_ms / total_thread_time * 100.0
+    } else {
+        0.0
+    };
+
+    Some(FocusedCallTree {
+        tree: root.into_node(focused_time_ms, total_thread_time, min_percent),
+        sample_count: matched_samples,
+        total_samples: thread.samples.len(),
+        focused_time_ms,
+        focused_percent,
+    })
+}
+
+fn sample_interval_ms(thread: &ResolvedThread) -> f64 {
+    if thread.samples.len() >= 2 {
+        thread.duration_ms / (thread.samples.len() - 1) as f64
+    } else {
+        1.0
+    }
 }
 
 struct TreeBuilder {
@@ -77,9 +166,28 @@ struct TreeBuilder {
 }
 
 impl TreeBuilder {
-    fn into_node(self, total_profile_time: f64, min_percent: f64) -> CallTreeNode {
-        let total_percent = if total_profile_time > 0.0 {
-            self.total_time / total_profile_time * 100.0
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            self_time: 0.0,
+            total_time: 0.0,
+            children: HashMap::new(),
+        }
+    }
+
+    fn into_node(
+        self,
+        percent_denominator_ms: f64,
+        thread_denominator_ms: f64,
+        min_percent: f64,
+    ) -> CallTreeNode {
+        let total_percent = if percent_denominator_ms > 0.0 {
+            self.total_time / percent_denominator_ms * 100.0
+        } else {
+            0.0
+        };
+        let thread_percent = if thread_denominator_ms > 0.0 {
+            self.total_time / thread_denominator_ms * 100.0
         } else {
             0.0
         };
@@ -88,46 +196,79 @@ impl TreeBuilder {
             .children
             .into_values()
             .filter(|c| {
-                let pct = if total_profile_time > 0.0 {
-                    c.total_time / total_profile_time * 100.0
+                let pct = if percent_denominator_ms > 0.0 {
+                    c.total_time / percent_denominator_ms * 100.0
                 } else {
                     0.0
                 };
                 pct >= min_percent
             })
-            .map(|c| c.into_node(total_profile_time, min_percent))
+            .map(|c| c.into_node(percent_denominator_ms, thread_denominator_ms, min_percent))
             .collect();
 
-        children.sort_by(|a, b| b.total_time_ms.partial_cmp(&a.total_time_ms).unwrap());
+        children.sort_by(|a, b| b.total_time_ms.total_cmp(&a.total_time_ms));
 
         CallTreeNode {
             function_name: self.name,
             self_time_ms: self.self_time,
             total_time_ms: self.total_time,
             total_percent,
+            thread_percent,
             children,
         }
     }
 }
 
 impl CallTreeNode {
-    pub fn render_text(&self, max_depth: usize) -> String {
+    pub fn render_text_with_options(
+        &self,
+        max_depth: usize,
+        short_names: bool,
+        show_thread_percent: bool,
+    ) -> String {
         let mut output = String::new();
-        self.render_recursive(&mut output, 0, max_depth);
+        self.render_recursive(&mut output, 0, max_depth, short_names, show_thread_percent);
         output
     }
 
-    fn render_recursive(&self, output: &mut String, depth: usize, max_depth: usize) {
+    fn render_recursive(
+        &self,
+        output: &mut String,
+        depth: usize,
+        max_depth: usize,
+        short_names: bool,
+        show_thread_percent: bool,
+    ) {
         if depth > max_depth {
             return;
         }
         let indent = "  ".repeat(depth);
-        output.push_str(&format!(
-            "{}{} [{:.1}% total, {:.1}ms self]\n",
-            indent, self.function_name, self.total_percent, self.self_time_ms,
-        ));
+        let name = if short_names {
+            symbols::compact_function_name(&self.function_name)
+        } else {
+            self.function_name.clone()
+        };
+
+        if show_thread_percent {
+            output.push_str(&format!(
+                "{}{} [{:.1}% focus / {:.2}% thread, {:.1}ms self]\n",
+                indent, name, self.total_percent, self.thread_percent, self.self_time_ms,
+            ));
+        } else {
+            output.push_str(&format!(
+                "{}{} [{:.1}% total, {:.1}ms self]\n",
+                indent, name, self.total_percent, self.self_time_ms,
+            ));
+        }
+
         for child in &self.children {
-            child.render_recursive(output, depth + 1, max_depth);
+            child.render_recursive(
+                output,
+                depth + 1,
+                max_depth,
+                short_names,
+                show_thread_percent,
+            );
         }
     }
 }
@@ -178,11 +319,59 @@ mod tests {
             ],
         };
 
-        let tree = build_call_tree(&thread, 10, 0.0);
+        let tree = build_call_tree_with_filter(&thread, 10, 0.0, |_| true);
         assert_eq!(tree.function_name, "(root)");
         assert_eq!(tree.children.len(), 1); // just "main"
         let main_node = &tree.children[0];
         assert_eq!(main_node.function_name, "main");
         assert_eq!(main_node.children.len(), 2); // "foo" and "baz"
+    }
+
+    #[test]
+    fn test_focused_call_tree_scales_to_matching_samples() {
+        let thread = ResolvedThread {
+            name: "test".to_string(),
+            pid: "1".to_string(),
+            tid: "1".to_string(),
+            is_main: true,
+            duration_ms: 30.0,
+            markers: vec![],
+            samples: vec![
+                ResolvedSample {
+                    timestamp_ms: 0.0,
+                    weight: 1,
+                    cpu_delta_us: None,
+                    stack: vec![make_frame("main"), make_frame("foo"), make_frame("bar")],
+                },
+                ResolvedSample {
+                    timestamp_ms: 10.0,
+                    weight: 1,
+                    cpu_delta_us: None,
+                    stack: vec![make_frame("main"), make_frame("foo"), make_frame("baz")],
+                },
+                ResolvedSample {
+                    timestamp_ms: 20.0,
+                    weight: 1,
+                    cpu_delta_us: None,
+                    stack: vec![make_frame("main"), make_frame("other")],
+                },
+                ResolvedSample {
+                    timestamp_ms: 30.0,
+                    weight: 1,
+                    cpu_delta_us: None,
+                    stack: vec![make_frame("main"), make_frame("other")],
+                },
+            ],
+        };
+
+        let focused =
+            build_focused_call_tree_with_filter(&thread, "foo", 10, 0.0, |_| true).unwrap();
+
+        assert_eq!(focused.sample_count, 2);
+        assert_eq!(focused.total_samples, 4);
+        assert_eq!(focused.focused_percent, 50.0);
+        assert_eq!(focused.tree.function_name, "foo");
+        assert_eq!(focused.tree.total_percent, 100.0);
+        assert_eq!(focused.tree.children.len(), 2);
     }
 }
