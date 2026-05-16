@@ -39,7 +39,7 @@ pub fn load_profile(path: &Path) -> Result<ResolvedProfile> {
 
 /// Look for a `.syms.json` sidecar next to the profile file.
 /// Samply writes e.g. `profile.json.gz` → `profile.json.syms.json`
-fn find_syms_sidecar(profile_path: &Path) -> Option<std::path::PathBuf> {
+pub(crate) fn find_syms_sidecar(profile_path: &Path) -> Option<std::path::PathBuf> {
     // Samply writes: profile.json.gz -> profile.json.syms.json
     // i.e. appends ".syms.json" after stripping the final ".gz"
     let file_name = profile_path.file_name()?.to_string_lossy();

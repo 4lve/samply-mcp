@@ -1,7 +1,9 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -14,7 +16,7 @@ use crate::analysis::call_tree;
 use crate::analysis::flamegraph;
 use crate::analysis::functions::{self, FunctionStats};
 use crate::analysis::symbols;
-use crate::profile::parse::load_profile;
+use crate::profile::parse::{find_syms_sidecar, load_profile};
 use crate::profile::resolved::{ResolvedProfile, ResolvedThread};
 
 /// Pre-computed analysis data cached per thread
@@ -38,6 +40,45 @@ impl AnalysisCache {
 struct CachedProfile {
     profile: Arc<ResolvedProfile>,
     cache: Arc<AnalysisCache>,
+    fingerprint: ProfileFingerprint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    modified: SystemTime,
+    len: u64,
+}
+
+impl FileFingerprint {
+    fn read(path: &PathBuf) -> Result<Self, String> {
+        let metadata = fs::metadata(path)
+            .map_err(|e| format!("Failed to stat '{}': {}", path.display(), e))?;
+        let modified = metadata
+            .modified()
+            .map_err(|e| format!("Failed to read mtime for '{}': {}", path.display(), e))?;
+
+        Ok(Self {
+            modified,
+            len: metadata.len(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileFingerprint {
+    profile: FileFingerprint,
+    symbols: Option<FileFingerprint>,
+}
+
+impl ProfileFingerprint {
+    fn read(path: &PathBuf) -> Result<Self, String> {
+        let profile = FileFingerprint::read(path)?;
+        let symbols = find_syms_sidecar(path)
+            .map(|path| FileFingerprint::read(&path))
+            .transpose()?;
+
+        Ok(Self { profile, symbols })
+    }
 }
 
 #[derive(Clone)]
@@ -64,20 +105,25 @@ impl ProfileServer {
     fn get_profile(&self, path: &str) -> Result<Arc<CachedProfile>, String> {
         let canonical =
             std::fs::canonicalize(path).map_err(|e| format!("Invalid path '{}': {}", path, e))?;
+        let fingerprint = ProfileFingerprint::read(&canonical)?;
 
         {
             let cache = self.profiles.lock().unwrap();
             if let Some(cached) = cache.get(&canonical) {
-                return Ok(Arc::clone(cached));
+                if cached.fingerprint == fingerprint {
+                    return Ok(Arc::clone(cached));
+                }
             }
         }
 
         let profile = load_profile(&canonical)
             .map_err(|e| format!("Failed to load profile '{}': {}", path, e))?;
         let analysis_cache = AnalysisCache::build(&profile);
+        let fingerprint = ProfileFingerprint::read(&canonical)?;
         let cached = Arc::new(CachedProfile {
             profile: Arc::new(profile),
             cache: Arc::new(analysis_cache),
+            fingerprint,
         });
 
         self.profiles
@@ -2003,6 +2049,8 @@ pub async fn run_server() -> Result<()> {
 mod tests {
     use super::*;
     use crate::profile::resolved::ResolvedSample;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn sample() -> ResolvedSample {
         ResolvedSample {
@@ -2040,6 +2088,61 @@ mod tests {
         }
     }
 
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("samply-mcp-{name}-{}-{now}", std::process::id()))
+    }
+
+    fn profile_json(thread_name: &str) -> String {
+        format!(
+            r#"{{
+                "meta": {{
+                    "categories": [{{ "name": "Other", "color": "grey", "subcategories": [] }}],
+                    "interval": 1,
+                    "product": "test"
+                }},
+                "libs": [],
+                "threads": [{{
+                    "name": "{thread_name}",
+                    "isMainThread": true,
+                    "pid": 1,
+                    "tid": 1,
+                    "unregisterTime": null,
+                    "frameTable": {{ "length": 1, "func": [0], "category": [0] }},
+                    "funcTable": {{ "length": 1, "name": [0] }},
+                    "stackTable": {{ "length": 1, "prefix": [null], "frame": [0] }},
+                    "samples": {{ "length": 1, "stack": [0], "time": [0], "weight": [1] }},
+                    "resourceTable": {{ "length": 0 }},
+                    "nativeSymbols": {{ "length": 0 }},
+                    "stringArray": ["root_function"]
+                }}]
+            }}"#
+        )
+    }
+
+    fn write_profile(path: &Path, thread_name: &str) {
+        std::fs::write(path, profile_json(thread_name)).unwrap();
+    }
+
+    fn rewrite_after_mtime_change(path: &Path, contents: impl Fn() -> String) {
+        let before = std::fs::metadata(path).unwrap().modified().unwrap();
+
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            std::fs::write(path, contents()).unwrap();
+
+            let after = std::fs::metadata(path).unwrap().modified().unwrap();
+            if after != before {
+                return;
+            }
+        }
+
+        panic!("file mtime did not change for {}", path.display());
+    }
+
     #[test]
     fn select_thread_defaults_to_main_thread_with_most_samples() {
         let profile = profile();
@@ -2069,5 +2172,42 @@ mod tests {
 
         assert_eq!(by_tid.index, 0);
         assert_eq!(by_index.thread.name, "worker");
+    }
+
+    #[test]
+    fn get_profile_reloads_when_profile_file_mtime_changes() {
+        let dir = unique_test_dir("cache-reload");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("profile.json");
+        write_profile(&path, "first");
+
+        let server = ProfileServer::new();
+        let first = server.get_profile(path.to_str().unwrap()).unwrap();
+        assert_eq!(first.profile.threads[0].name, "first");
+
+        rewrite_after_mtime_change(&path, || profile_json("second"));
+
+        let second = server.get_profile(path.to_str().unwrap()).unwrap();
+        assert_eq!(second.profile.threads[0].name, "second");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn profile_fingerprint_includes_syms_sidecar_mtime() {
+        let dir = unique_test_dir("sidecar-cache");
+        std::fs::create_dir(&dir).unwrap();
+        let profile_path = dir.join("profile.json");
+        let syms_path = dir.join("profile.json.syms.json");
+        write_profile(&profile_path, "profile");
+        std::fs::write(&syms_path, "{}").unwrap();
+
+        let first = ProfileFingerprint::read(&profile_path).unwrap();
+        rewrite_after_mtime_change(&syms_path, || "{\"changed\":true}".to_string());
+        let second = ProfileFingerprint::read(&profile_path).unwrap();
+
+        assert_ne!(first, second);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
