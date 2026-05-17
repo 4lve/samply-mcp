@@ -28,111 +28,150 @@ pub enum CallerRelationship {
     Immediate,
 }
 
+#[cfg(test)]
 pub fn build_call_tree_with_filter(
     thread: &ResolvedThread,
     max_depth: usize,
     min_percent: f64,
+    include_frame: impl FnMut(&str) -> bool,
+) -> CallTreeNode {
+    build_call_tree_for_threads_with_filter(&[thread], max_depth, min_percent, include_frame)
+}
+
+pub fn build_call_tree_for_threads_with_filter(
+    threads: &[&ResolvedThread],
+    max_depth: usize,
+    min_percent: f64,
     mut include_frame: impl FnMut(&str) -> bool,
 ) -> CallTreeNode {
-    let interval_ms = sample_interval_ms(thread);
-
-    let total_time = interval_ms * thread.samples.len() as f64;
+    let total_time: f64 = threads
+        .iter()
+        .map(|thread| sample_interval_ms(thread) * thread.samples.len() as f64)
+        .sum();
 
     let mut root = TreeBuilder::new("(root)".to_string());
 
-    for sample in &thread.samples {
-        if sample.stack.is_empty() {
-            root.self_time += interval_ms;
-            root.total_time += interval_ms;
-            continue;
-        }
+    for thread in threads {
+        let interval_ms = sample_interval_ms(thread);
 
-        root.total_time += interval_ms;
-        let mut node = &mut root;
-        let mut assigned_self_time = false;
-
-        for (included_depth, frame) in sample
-            .stack
-            .iter()
-            .filter(|frame| include_frame(&frame.function_name))
-            .enumerate()
-        {
-            if included_depth >= max_depth {
-                // Attribute remaining time as self-time of the deepest node
-                node.self_time += interval_ms;
-                assigned_self_time = true;
-                break;
+        for sample in &thread.samples {
+            if sample.stack.is_empty() {
+                root.self_time += interval_ms;
+                root.total_time += interval_ms;
+                continue;
             }
 
-            node = node
-                .children
-                .entry(frame.function_name.clone())
-                .or_insert_with(|| TreeBuilder::new(frame.function_name.clone()));
-            node.total_time += interval_ms;
+            root.total_time += interval_ms;
+            let mut node = &mut root;
+            let mut assigned_self_time = false;
 
-            // Leaf self-time is assigned after filtering below.
-        }
+            for (included_depth, frame) in sample
+                .stack
+                .iter()
+                .filter(|frame| include_frame(&frame.function_name))
+                .enumerate()
+            {
+                if included_depth >= max_depth {
+                    // Attribute remaining time as self-time of the deepest node
+                    node.self_time += interval_ms;
+                    assigned_self_time = true;
+                    break;
+                }
 
-        if !assigned_self_time {
-            node.self_time += interval_ms;
+                node = node
+                    .children
+                    .entry(frame.function_name.clone())
+                    .or_insert_with(|| TreeBuilder::new(frame.function_name.clone()));
+                node.total_time += interval_ms;
+
+                // Leaf self-time is assigned after filtering below.
+            }
+
+            if !assigned_self_time {
+                node.self_time += interval_ms;
+            }
         }
     }
 
     root.into_node(total_time, total_time, min_percent)
 }
 
+#[cfg(test)]
 pub fn build_focused_call_tree_with_filter(
     thread: &ResolvedThread,
     function_name: &str,
     max_depth: usize,
     min_percent: f64,
+    include_frame: impl FnMut(&str) -> bool,
+) -> Option<FocusedCallTree> {
+    build_focused_call_tree_for_threads_with_filter(
+        &[thread],
+        function_name,
+        max_depth,
+        min_percent,
+        include_frame,
+    )
+}
+
+pub fn build_focused_call_tree_for_threads_with_filter(
+    threads: &[&ResolvedThread],
+    function_name: &str,
+    max_depth: usize,
+    min_percent: f64,
     mut include_frame: impl FnMut(&str) -> bool,
 ) -> Option<FocusedCallTree> {
-    let interval_ms = sample_interval_ms(thread);
-    let total_thread_time = interval_ms * thread.samples.len() as f64;
+    let total_thread_time: f64 = threads
+        .iter()
+        .map(|thread| sample_interval_ms(thread) * thread.samples.len() as f64)
+        .sum();
+    let total_samples = threads.iter().map(|thread| thread.samples.len()).sum();
 
     let mut root = TreeBuilder::new(function_name.to_string());
     let mut matched_samples = 0usize;
 
-    for sample in &thread.samples {
-        let Some(focus_index) = sample
-            .stack
-            .iter()
-            .position(|frame| frame.function_name == function_name)
-        else {
-            continue;
-        };
+    for thread in threads {
+        let interval_ms = sample_interval_ms(thread);
 
-        matched_samples += 1;
-        root.total_time += interval_ms;
-
-        if max_depth == 0 {
-            root.self_time += interval_ms;
-            continue;
-        }
-
-        let mut node = &mut root;
-        let mut assigned_self_time = false;
-        for (included_depth, frame) in (1usize..).zip(
-            sample.stack[focus_index + 1..]
+        for sample in &thread.samples {
+            let Some(focus_index) = sample
+                .stack
                 .iter()
-                .filter(|frame| include_frame(&frame.function_name)),
-        ) {
-            if included_depth >= max_depth {
-                node.self_time += interval_ms;
-                assigned_self_time = true;
-                break;
+                .position(|frame| frame.function_name == function_name)
+            else {
+                continue;
+            };
+
+            matched_samples += 1;
+            root.total_time += interval_ms;
+
+            if max_depth == 0 {
+                root.self_time += interval_ms;
+                continue;
             }
 
-            node = node
-                .children
-                .entry(frame.function_name.clone())
-                .or_insert_with(|| TreeBuilder::new(frame.function_name.clone()));
-            node.total_time += interval_ms;
-        }
+            let mut node = &mut root;
+            let mut assigned_self_time = false;
+            for (included_depth, frame) in (1usize..).zip(
+                sample.stack[focus_index + 1..]
+                    .iter()
+                    .filter(|frame| include_frame(&frame.function_name)),
+            ) {
+                if included_depth >= max_depth {
+                    node.self_time += interval_ms;
+                    assigned_self_time = true;
+                    break;
+                }
 
-        if !assigned_self_time {
-            node.self_time += interval_ms;
+                node = node
+                    .children
+                    .entry(frame.function_name.clone())
+                    .or_insert_with(|| TreeBuilder::new(frame.function_name.clone()));
+                node.total_time += interval_ms;
+            }
+
+            if !assigned_self_time {
+                node.self_time += interval_ms;
+            }
         }
     }
 
@@ -140,7 +179,7 @@ pub fn build_focused_call_tree_with_filter(
         return None;
     }
 
-    let focused_time_ms = interval_ms * matched_samples as f64;
+    let focused_time_ms = root.total_time;
     let focused_percent = if total_thread_time > 0.0 {
         focused_time_ms / total_thread_time * 100.0
     } else {
@@ -150,7 +189,7 @@ pub fn build_focused_call_tree_with_filter(
     Some(FocusedCallTree {
         tree: root.into_node(focused_time_ms, total_thread_time, min_percent),
         sample_count: matched_samples,
-        total_samples: thread.samples.len(),
+        total_samples,
         focused_time_ms,
         focused_percent,
     })

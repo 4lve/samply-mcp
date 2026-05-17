@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use anyhow::Result;
+use regex::Regex;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{ServerCapabilities, ServerInfo};
@@ -256,6 +257,74 @@ fn function_passes_filters(
     true
 }
 
+fn compile_optional_regex(pattern: &Option<String>, label: &str) -> Result<Option<Regex>, String> {
+    let Some(pattern) = pattern.as_deref().map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+
+    Regex::new(pattern)
+        .map(Some)
+        .map_err(|e| format!("Invalid {label} regex '{pattern}': {e}"))
+}
+
+struct FrameNameFilter {
+    include: Option<String>,
+    exclude: Option<String>,
+    include_regex: Option<Regex>,
+    exclude_regex: Option<Regex>,
+    exclude_framework: bool,
+}
+
+impl FrameNameFilter {
+    fn new(
+        include: &Option<String>,
+        exclude: &Option<String>,
+        include_regex: &Option<String>,
+        exclude_regex: &Option<String>,
+        exclude_framework: bool,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            include: include.clone(),
+            exclude: exclude.clone(),
+            include_regex: compile_optional_regex(include_regex, "include")?,
+            exclude_regex: compile_optional_regex(exclude_regex, "exclude")?,
+            exclude_framework,
+        })
+    }
+
+    fn includes(&self, name: &str) -> bool {
+        if let Some(include) = &self.include
+            && !pattern_matches(name, include)
+        {
+            return false;
+        }
+
+        if let Some(include_regex) = &self.include_regex
+            && !include_regex.is_match(name)
+        {
+            return false;
+        }
+
+        if let Some(exclude) = &self.exclude
+            && pattern_matches(name, exclude)
+        {
+            return false;
+        }
+
+        if let Some(exclude_regex) = &self.exclude_regex
+            && exclude_regex.is_match(name)
+        {
+            return false;
+        }
+
+        if self.exclude_framework && symbols::is_framework_function(name, None) {
+            return false;
+        }
+
+        true
+    }
+}
+
 fn sort_function_stats(stats: &mut [FunctionStats], sort_by: &str) {
     if sort_by == "total" {
         stats.sort_by(|a, b| b.total_time_ms.total_cmp(&a.total_time_ms));
@@ -366,20 +435,131 @@ fn thread_name_matches_prefix(thread_name: &str, prefix: &str) -> bool {
     thread_name.starts_with(&normalized_thread_prefix(prefix))
 }
 
+fn summary_thread_name_prefix(thread_name: &str) -> String {
+    let prefix = thread_name.trim_end_matches(|c: char| c.is_ascii_digit());
+    if prefix.is_empty() {
+        thread_name.to_string()
+    } else {
+        prefix.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThreadSampleSummary {
+    sample_count: usize,
+    wall_time_ms: f64,
+    cpu_sample_time_ms: f64,
+    cpu_sample_percent_of_wall: f64,
+    samples_per_second: f64,
+}
+
+fn thread_sample_summary(
+    profile: &ResolvedProfile,
+    thread_indices: &[usize],
+) -> ThreadSampleSummary {
+    let sample_count: usize = thread_indices
+        .iter()
+        .filter_map(|index| profile.threads.get(*index))
+        .map(|thread| thread.samples.len())
+        .sum();
+    let wall_time_ms: f64 = thread_indices
+        .iter()
+        .filter_map(|index| profile.threads.get(*index))
+        .map(|thread| thread.duration_ms)
+        .sum();
+    let cpu_sample_time_ms = profile.interval_ms * sample_count as f64;
+    let samples_per_second = if wall_time_ms > 0.0 {
+        sample_count as f64 / wall_time_ms * 1000.0
+    } else {
+        0.0
+    };
+
+    ThreadSampleSummary {
+        sample_count,
+        wall_time_ms,
+        cpu_sample_time_ms,
+        cpu_sample_percent_of_wall: percent(cpu_sample_time_ms, wall_time_ms),
+        samples_per_second,
+    }
+}
+
+fn thread_info(profile: &ResolvedProfile, index: usize, thread: &ResolvedThread) -> ThreadInfo {
+    let summary = thread_sample_summary(profile, &[index]);
+
+    ThreadInfo {
+        index,
+        name: thread.name.clone(),
+        pid: thread.pid.clone(),
+        tid: thread.tid.clone(),
+        sample_count: thread.samples.len(),
+        duration_ms: thread.duration_ms,
+        wall_time_ms: round2(summary.wall_time_ms),
+        cpu_sample_time_ms: round2(summary.cpu_sample_time_ms),
+        cpu_sample_percent_of_wall: round2(summary.cpu_sample_percent_of_wall),
+        samples_per_second: round2(summary.samples_per_second),
+        is_main: thread.is_main,
+    }
+}
+
 fn thread_infos(profile: &ResolvedProfile, thread_indices: &[usize]) -> Vec<ThreadInfo> {
     thread_indices
         .iter()
         .filter_map(|index| profile.threads.get(*index).map(|thread| (*index, thread)))
-        .map(|(index, thread)| ThreadInfo {
-            index,
-            name: thread.name.clone(),
-            pid: thread.pid.clone(),
-            tid: thread.tid.clone(),
-            sample_count: thread.samples.len(),
-            duration_ms: thread.duration_ms,
-            is_main: thread.is_main,
-        })
+        .map(|(index, thread)| thread_info(profile, index, thread))
         .collect()
+}
+
+fn thread_summary_groups(
+    profile: &ResolvedProfile,
+    thread_indices: &[usize],
+) -> Vec<ThreadSummaryGroup> {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+
+    for index in thread_indices {
+        let Some(thread) = profile.threads.get(*index) else {
+            continue;
+        };
+        groups
+            .entry(summary_thread_name_prefix(&thread.name))
+            .or_default()
+            .push(*index);
+    }
+
+    let mut summaries: Vec<ThreadSummaryGroup> = groups
+        .into_iter()
+        .map(|(name_prefix, indices)| {
+            let summary = thread_sample_summary(profile, &indices);
+            let max_thread_duration_ms = indices
+                .iter()
+                .filter_map(|index| profile.threads.get(*index))
+                .map(|thread| thread.duration_ms)
+                .fold(0.0, f64::max);
+            let main_thread_count = indices
+                .iter()
+                .filter_map(|index| profile.threads.get(*index))
+                .filter(|thread| thread.is_main)
+                .count();
+
+            ThreadSummaryGroup {
+                name_prefix,
+                thread_count: indices.len(),
+                sample_count: summary.sample_count,
+                wall_time_ms: round2(summary.wall_time_ms),
+                cpu_sample_time_ms: round2(summary.cpu_sample_time_ms),
+                cpu_sample_percent_of_wall: round2(summary.cpu_sample_percent_of_wall),
+                samples_per_second: round2(summary.samples_per_second),
+                max_thread_duration_ms: round2(max_thread_duration_ms),
+                main_thread_count,
+            }
+        })
+        .collect();
+
+    summaries.sort_by(|a, b| {
+        b.sample_count
+            .cmp(&a.sample_count)
+            .then_with(|| a.name_prefix.cmp(&b.name_prefix))
+    });
+    summaries
 }
 
 fn scope_total_time_ms(profile: &ResolvedProfile, thread_indices: &[usize]) -> f64 {
@@ -518,6 +698,65 @@ fn select_thread_indices_for_scope(
     Ok(("all sampled threads".to_string(), indices))
 }
 
+struct ThreadScopeSelection<'a> {
+    scope: String,
+    thread_indices: Vec<usize>,
+    selected_thread: Option<SelectedThread<'a>>,
+}
+
+fn select_thread_indices_for_single_or_prefix_scope<'a>(
+    profile: &'a ResolvedProfile,
+    thread: &Option<String>,
+    tid: &Option<String>,
+    thread_index: Option<usize>,
+    thread_name_prefix: &Option<String>,
+    thread_name_prefixes: &[String],
+) -> Result<ThreadScopeSelection<'a>, String> {
+    let prefixes = requested_thread_prefixes(thread_name_prefix, thread_name_prefixes);
+    let has_explicit_thread_selector = thread.is_some() || tid.is_some() || thread_index.is_some();
+
+    if has_explicit_thread_selector && !prefixes.is_empty() {
+        return Err(
+            "Use either thread/tid/thread_index or thread_name_prefix, not both".to_string(),
+        );
+    }
+
+    if !prefixes.is_empty() {
+        let mut thread_indices = Vec::new();
+        for (index, thread) in profile.threads.iter().enumerate() {
+            if prefixes
+                .iter()
+                .any(|prefix| thread_name_matches_prefix(&thread.name, prefix))
+            {
+                thread_indices.push(index);
+            }
+        }
+
+        if thread_indices.is_empty() {
+            return Err(format!(
+                "No threads matched prefix(es): {}",
+                prefixes.join(", ")
+            ));
+        }
+
+        return Ok(ThreadScopeSelection {
+            scope: format!("thread prefix(es): {}", prefixes.join(", ")),
+            thread_indices,
+            selected_thread: None,
+        });
+    }
+
+    let selected = select_thread(profile, thread, tid, thread_index)?;
+    let scope = thread_label(selected.index, selected.thread);
+    let thread_indices = vec![selected.index];
+
+    Ok(ThreadScopeSelection {
+        scope,
+        thread_indices,
+        selected_thread: Some(selected),
+    })
+}
+
 fn parse_caller_relationship(value: &str) -> Result<call_tree::CallerRelationship, String> {
     match value.trim().to_lowercase().as_str() {
         "ancestor" => Ok(call_tree::CallerRelationship::Ancestor),
@@ -624,6 +863,38 @@ pub struct ProfileInfoRequest {
 pub struct ProfileThreadsRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
+
+    #[schemars(
+        description = "Optional thread name prefix filter. A trailing '*' is accepted for convenience."
+    )]
+    #[serde(default)]
+    pub thread_name_prefix: Option<String>,
+
+    #[schemars(
+        description = "Optional thread name prefix filters. A trailing '*' is accepted for convenience."
+    )]
+    #[serde(default)]
+    pub thread_name_prefixes: Vec<String>,
+
+    #[schemars(description = "Optional regex filter for thread names.")]
+    #[serde(default)]
+    pub thread_name_regex: Option<String>,
+
+    #[schemars(description = "Only include threads with at least this many samples.")]
+    #[serde(default)]
+    pub min_samples: Option<usize>,
+
+    #[schemars(description = "Only include threads alive for at least this many milliseconds.")]
+    #[serde(default)]
+    pub min_duration_ms: Option<f64>,
+
+    #[schemars(description = "Return compact groups by inferred thread name prefix.")]
+    #[serde(default)]
+    pub group_by_name_prefix: bool,
+
+    #[schemars(description = "Include per-thread rows in the result (default: true).")]
+    #[serde(default = "default_include_threads")]
+    pub include_threads: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -726,6 +997,10 @@ pub struct ThreadGroupTopFunctionsRequest {
     #[schemars(description = "Alias for exclude_framework")]
     #[serde(default)]
     pub user_code_only: bool,
+
+    #[schemars(description = "Include matching thread rows in each group (default: true).")]
+    #[serde(default = "default_include_threads")]
+    pub include_threads: bool,
 }
 
 fn default_sort_by() -> String {
@@ -734,6 +1009,10 @@ fn default_sort_by() -> String {
 
 fn default_limit() -> usize {
     20
+}
+
+fn default_include_threads() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -759,6 +1038,34 @@ pub struct CallTreeRequest {
     #[serde(default)]
     pub thread_index: Option<usize>,
 
+    #[schemars(
+        description = "Thread name prefix to aggregate. A trailing '*' is accepted, e.g. bench-feature-* matches names starting with bench-feature-."
+    )]
+    #[serde(default)]
+    pub thread_name_prefix: Option<String>,
+
+    #[schemars(
+        description = "Thread name prefixes to aggregate. A trailing '*' is accepted for prefix-style globs."
+    )]
+    #[serde(default)]
+    pub thread_name_prefixes: Vec<String>,
+
+    #[schemars(
+        description = "Optional full function name or substring. If set, reroot the call tree at this function."
+    )]
+    #[serde(default)]
+    pub focus_function: Option<String>,
+
+    #[schemars(
+        description = "Stable function id returned by profile_search_functions or profile_top_functions"
+    )]
+    #[serde(default)]
+    pub focus_function_id: Option<String>,
+
+    #[schemars(description = "Match mode for focus_function: 'contains' (default) or 'exact'")]
+    #[serde(default = "default_match_mode")]
+    pub match_mode: String,
+
     #[schemars(description = "Maximum depth of the call tree (default: 10)")]
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
@@ -780,6 +1087,30 @@ pub struct CallTreeRequest {
     #[schemars(description = "Use compact Rust display names in the rendered tree")]
     #[serde(default)]
     pub short_names: bool,
+
+    #[schemars(
+        description = "Optional case-insensitive function name include filter. Use '|' to separate alternatives."
+    )]
+    #[serde(default)]
+    pub include: Option<String>,
+
+    #[schemars(
+        description = "Optional case-insensitive function name exclude filter. Use '|' to separate alternatives."
+    )]
+    #[serde(default)]
+    pub exclude: Option<String>,
+
+    #[schemars(description = "Optional regex include filter for function names.")]
+    #[serde(default)]
+    pub include_regex: Option<String>,
+
+    #[schemars(description = "Optional regex exclude filter for function names.")]
+    #[serde(default)]
+    pub exclude_regex: Option<String>,
+
+    #[schemars(description = "Include matching thread rows in the result (default: false).")]
+    #[serde(default)]
+    pub include_threads: bool,
 }
 
 fn default_max_depth() -> usize {
@@ -982,6 +1313,18 @@ pub struct FocusFunctionRequest {
     #[serde(default)]
     pub thread_index: Option<usize>,
 
+    #[schemars(
+        description = "Thread name prefix to aggregate before focusing. A trailing '*' is accepted, e.g. bench-feature-*."
+    )]
+    #[serde(default)]
+    pub thread_name_prefix: Option<String>,
+
+    #[schemars(
+        description = "Thread name prefixes to aggregate before focusing. A trailing '*' is accepted for prefix-style globs."
+    )]
+    #[serde(default)]
+    pub thread_name_prefixes: Vec<String>,
+
     #[schemars(description = "Maximum depth of the focused call tree (default: 10)")]
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
@@ -1003,6 +1346,34 @@ pub struct FocusFunctionRequest {
     #[schemars(description = "Use compact Rust display names in the rendered tree")]
     #[serde(default = "default_short_names")]
     pub short_names: bool,
+
+    #[schemars(
+        description = "Optional case-insensitive function name include filter for rendered descendants. Use '|' to separate alternatives."
+    )]
+    #[serde(default)]
+    pub include: Option<String>,
+
+    #[schemars(
+        description = "Optional case-insensitive function name exclude filter for rendered descendants. Use '|' to separate alternatives."
+    )]
+    #[serde(default)]
+    pub exclude: Option<String>,
+
+    #[schemars(
+        description = "Optional regex include filter for rendered descendant function names."
+    )]
+    #[serde(default)]
+    pub include_regex: Option<String>,
+
+    #[schemars(
+        description = "Optional regex exclude filter for rendered descendant function names."
+    )]
+    #[serde(default)]
+    pub exclude_regex: Option<String>,
+
+    #[schemars(description = "Include matching thread rows in the result (default: false).")]
+    #[serde(default)]
+    pub include_threads: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1091,6 +1462,34 @@ pub struct FunctionUnderCallerRequest {
     #[schemars(description = "Use compact Rust display names in the rendered tree")]
     #[serde(default = "default_short_names")]
     pub short_names: bool,
+
+    #[schemars(
+        description = "Optional case-insensitive function name include filter for rendered descendants. Use '|' to separate alternatives."
+    )]
+    #[serde(default)]
+    pub include: Option<String>,
+
+    #[schemars(
+        description = "Optional case-insensitive function name exclude filter for rendered descendants. Use '|' to separate alternatives."
+    )]
+    #[serde(default)]
+    pub exclude: Option<String>,
+
+    #[schemars(
+        description = "Optional regex include filter for rendered descendant function names."
+    )]
+    #[serde(default)]
+    pub include_regex: Option<String>,
+
+    #[schemars(
+        description = "Optional regex exclude filter for rendered descendant function names."
+    )]
+    #[serde(default)]
+    pub exclude_regex: Option<String>,
+
+    #[schemars(description = "Include matching thread rows in the result (default: true).")]
+    #[serde(default = "default_include_threads")]
+    pub include_threads: bool,
 }
 
 fn default_caller_mode() -> String {
@@ -1117,12 +1516,30 @@ pub struct ThreadInfo {
     pub tid: String,
     pub sample_count: usize,
     pub duration_ms: f64,
+    pub wall_time_ms: f64,
+    pub cpu_sample_time_ms: f64,
+    pub cpu_sample_percent_of_wall: f64,
+    pub samples_per_second: f64,
     pub is_main: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProfileThreadsResult {
     pub threads: Vec<ThreadInfo>,
+    pub groups: Vec<ThreadSummaryGroup>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ThreadSummaryGroup {
+    pub name_prefix: String,
+    pub thread_count: usize,
+    pub sample_count: usize,
+    pub wall_time_ms: f64,
+    pub cpu_sample_time_ms: f64,
+    pub cpu_sample_percent_of_wall: f64,
+    pub samples_per_second: f64,
+    pub max_thread_duration_ms: f64,
+    pub main_thread_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1162,6 +1579,10 @@ pub struct ThreadGroupTopFunctionsGroup {
     pub thread_count: usize,
     pub sample_count: usize,
     pub total_time_ms: f64,
+    pub wall_time_ms: f64,
+    pub cpu_sample_time_ms: f64,
+    pub cpu_sample_percent_of_wall: f64,
+    pub samples_per_second: f64,
     pub sort_by: String,
     pub threads: Vec<ThreadInfo>,
     pub functions: Vec<FunctionRow>,
@@ -1222,9 +1643,23 @@ pub struct FunctionDetailResult {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CallTreeResult {
-    pub thread: String,
-    pub tid: String,
-    pub thread_index: usize,
+    pub scope: String,
+    pub thread: Option<String>,
+    pub tid: Option<String>,
+    pub thread_index: Option<usize>,
+    pub thread_count: usize,
+    pub sample_count: usize,
+    pub wall_time_ms: f64,
+    pub cpu_sample_time_ms: f64,
+    pub cpu_sample_percent_of_wall: f64,
+    pub samples_per_second: f64,
+    pub threads: Vec<ThreadInfo>,
+    pub focus_function: Option<String>,
+    pub focus_function_id: Option<String>,
+    pub focus_display_name: Option<String>,
+    pub matched_samples: Option<usize>,
+    pub focused_time_ms: Option<f64>,
+    pub focused_percent: Option<f64>,
     pub tree: String,
 }
 
@@ -1258,14 +1693,22 @@ pub struct FlamegraphResult {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FocusFunctionResult {
-    pub thread: String,
-    pub tid: String,
-    pub thread_index: usize,
+    pub scope: String,
+    pub thread: Option<String>,
+    pub tid: Option<String>,
+    pub thread_index: Option<usize>,
+    pub thread_count: usize,
+    pub threads: Vec<ThreadInfo>,
     pub function_id: String,
     pub function_name: String,
     pub display_name: String,
     pub matched_samples: usize,
     pub total_thread_samples: usize,
+    pub total_scope_samples: usize,
+    pub wall_time_ms: f64,
+    pub cpu_sample_time_ms: f64,
+    pub cpu_sample_percent_of_wall: f64,
+    pub samples_per_second: f64,
     pub focused_percent: f64,
     pub focused_time_ms: f64,
     pub tree: String,
@@ -1288,6 +1731,10 @@ pub struct FunctionUnderCallerResult {
     pub descendant_time_ms: f64,
     pub caller_context_time_ms: f64,
     pub scope_time_ms: f64,
+    pub wall_time_ms: f64,
+    pub cpu_sample_time_ms: f64,
+    pub cpu_sample_percent_of_wall: f64,
+    pub samples_per_second: f64,
     pub exclusive_percent_of_scope: f64,
     pub descendant_percent_of_scope: f64,
     pub caller_context_percent_of_scope: f64,
@@ -1324,7 +1771,7 @@ impl ProfileServer {
     }
 
     #[tool(
-        description = "List all threads with names, sample counts, time ranges, and whether they are the main thread"
+        description = "List threads with optional prefix/regex/sample/duration filters, CPU-sample vs wall-time summaries, and optional compact groups by name prefix"
     )]
     fn profile_threads(
         &self,
@@ -1332,23 +1779,57 @@ impl ProfileServer {
     ) -> Result<Json<ProfileThreadsResult>, String> {
         let cached = self.get_profile(&req.path)?;
         let profile = &cached.profile;
+        let prefixes =
+            requested_thread_prefixes(&req.thread_name_prefix, &req.thread_name_prefixes);
+        let thread_name_regex = compile_optional_regex(&req.thread_name_regex, "thread_name")?;
 
-        let threads = profile
+        let thread_indices: Vec<usize> = profile
             .threads
             .iter()
             .enumerate()
-            .map(|(index, t)| ThreadInfo {
-                index,
-                name: t.name.clone(),
-                pid: t.pid.clone(),
-                tid: t.tid.clone(),
-                sample_count: t.samples.len(),
-                duration_ms: t.duration_ms,
-                is_main: t.is_main,
-            })
-            .collect();
+            .filter(|(_, thread)| {
+                if !prefixes.is_empty()
+                    && !prefixes
+                        .iter()
+                        .any(|prefix| thread_name_matches_prefix(&thread.name, prefix))
+                {
+                    return false;
+                }
 
-        Ok(Json(ProfileThreadsResult { threads }))
+                if let Some(regex) = &thread_name_regex
+                    && !regex.is_match(&thread.name)
+                {
+                    return false;
+                }
+
+                if let Some(min_samples) = req.min_samples
+                    && thread.samples.len() < min_samples
+                {
+                    return false;
+                }
+
+                if let Some(min_duration_ms) = req.min_duration_ms
+                    && thread.duration_ms < min_duration_ms
+                {
+                    return false;
+                }
+
+                true
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let groups = if req.group_by_name_prefix {
+            thread_summary_groups(profile, &thread_indices)
+        } else {
+            Vec::new()
+        };
+        let threads = if req.include_threads {
+            thread_infos(profile, &thread_indices)
+        } else {
+            Vec::new()
+        };
+
+        Ok(Json(ProfileThreadsResult { threads, groups }))
     }
 
     #[tool(
@@ -1442,6 +1923,7 @@ impl ProfileServer {
             let (mut stats, total_time_ms, sample_count) =
                 aggregate_function_stats(&cached, &thread_indices);
             sort_function_stats(&mut stats, &req.sort_by);
+            let summary = thread_sample_summary(&cached.profile, &thread_indices);
 
             let functions = stats
                 .into_iter()
@@ -1471,8 +1953,16 @@ impl ProfileServer {
                 thread_count: thread_indices.len(),
                 sample_count,
                 total_time_ms: round2(total_time_ms),
+                wall_time_ms: round2(summary.wall_time_ms),
+                cpu_sample_time_ms: round2(summary.cpu_sample_time_ms),
+                cpu_sample_percent_of_wall: round2(summary.cpu_sample_percent_of_wall),
+                samples_per_second: round2(summary.samples_per_second),
                 sort_by: req.sort_by.clone(),
-                threads: thread_infos(&cached.profile, &thread_indices),
+                threads: if req.include_threads {
+                    thread_infos(&cached.profile, &thread_indices)
+                } else {
+                    Vec::new()
+                },
                 functions,
             });
         }
@@ -1680,88 +2170,228 @@ impl ProfileServer {
     }
 
     #[tool(
-        description = "Get a hierarchical call tree showing where time is spent, with configurable depth and minimum percentage threshold"
+        description = "Get a hierarchical call tree showing where time is spent, with optional thread-prefix aggregation and focused rerooting"
     )]
     fn profile_call_tree(
         &self,
         Parameters(req): Parameters<CallTreeRequest>,
     ) -> Result<Json<CallTreeResult>, String> {
         let cached = self.get_profile(&req.path)?;
-        let selected = select_thread(&cached.profile, &req.thread, &req.tid, req.thread_index)?;
-        let thread = selected.thread;
+        let selection = select_thread_indices_for_single_or_prefix_scope(
+            &cached.profile,
+            &req.thread,
+            &req.tid,
+            req.thread_index,
+            &req.thread_name_prefix,
+            &req.thread_name_prefixes,
+        )?;
+        let thread_refs: Vec<&ResolvedThread> = selection
+            .thread_indices
+            .iter()
+            .filter_map(|index| cached.profile.threads.get(*index))
+            .collect();
 
         let exclude_framework =
             exclude_framework_enabled(req.exclude_framework, req.user_code_only);
-        let tree = call_tree::build_call_tree_with_filter(
-            thread,
-            req.max_depth,
-            req.min_percent,
-            |name| !exclude_framework || !symbols::is_framework_function(name, None),
-        );
-        let text = tree.render_text_with_options(req.max_depth, req.short_names, false);
+        let frame_filter = FrameNameFilter::new(
+            &req.include,
+            &req.exclude,
+            &req.include_regex,
+            &req.exclude_regex,
+            exclude_framework,
+        )?;
+        let focus_function = if req.focus_function.is_some() || req.focus_function_id.is_some() {
+            Some(
+                resolve_function_name_in_threads(
+                    &cached.cache.function_stats,
+                    req.focus_function.as_deref(),
+                    req.focus_function_id.as_deref(),
+                    &req.match_mode,
+                    Some(&selection.thread_indices),
+                )
+                .ok_or_else(|| {
+                    "Focus function not found in selected thread scope. Provide focus_function_id or focus_function; try profile_search_functions first.".to_string()
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let (text, matched_samples, focused_time_ms, focused_percent) =
+            if let Some(function_name) = &focus_function {
+                let focused = call_tree::build_focused_call_tree_for_threads_with_filter(
+                    &thread_refs,
+                    function_name,
+                    req.max_depth,
+                    req.min_percent,
+                    |name| frame_filter.includes(name),
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "Function '{}' did not appear in any samples in scope {}",
+                        function_name, selection.scope
+                    )
+                })?;
+                (
+                    focused
+                        .tree
+                        .render_text_with_options(req.max_depth, req.short_names, true),
+                    Some(focused.sample_count),
+                    Some(round2(focused.focused_time_ms)),
+                    Some(round2(focused.focused_percent)),
+                )
+            } else {
+                let tree = call_tree::build_call_tree_for_threads_with_filter(
+                    &thread_refs,
+                    req.max_depth,
+                    req.min_percent,
+                    |name| frame_filter.includes(name),
+                );
+                (
+                    tree.render_text_with_options(req.max_depth, req.short_names, false),
+                    None,
+                    None,
+                    None,
+                )
+            };
+        let focus_function_id = focus_function
+            .as_ref()
+            .map(|function_name| symbols::function_id(function_name));
+        let focus_display_name = focus_function
+            .as_ref()
+            .map(|function_name| symbols::compact_function_name(function_name));
+        let summary = thread_sample_summary(&cached.profile, &selection.thread_indices);
+        let (thread, tid, thread_index) = if let Some(selected_thread) = &selection.selected_thread
+        {
+            (
+                Some(selected_thread.thread.name.clone()),
+                Some(selected_thread.thread.tid.clone()),
+                Some(selected_thread.index),
+            )
+        } else {
+            (None, None, None)
+        };
 
         Ok(Json(CallTreeResult {
-            thread: thread.name.clone(),
-            tid: thread.tid.clone(),
-            thread_index: selected.index,
+            scope: selection.scope,
+            thread,
+            tid,
+            thread_index,
+            thread_count: selection.thread_indices.len(),
+            sample_count: summary.sample_count,
+            wall_time_ms: round2(summary.wall_time_ms),
+            cpu_sample_time_ms: round2(summary.cpu_sample_time_ms),
+            cpu_sample_percent_of_wall: round2(summary.cpu_sample_percent_of_wall),
+            samples_per_second: round2(summary.samples_per_second),
+            threads: if req.include_threads {
+                thread_infos(&cached.profile, &selection.thread_indices)
+            } else {
+                Vec::new()
+            },
+            focus_function,
+            focus_function_id,
+            focus_display_name,
+            matched_samples,
+            focused_time_ms,
+            focused_percent,
             tree: text,
         }))
     }
 
     #[tool(
-        description = "Focus on a function by full name or substring. Reroots stacks at the matched function and reports a call tree relative only to samples containing that function."
+        description = "Focus on a function by full name or substring. Reroots stacks at the matched function for one thread or a thread-name-prefix scope."
     )]
     fn profile_focus_function(
         &self,
         Parameters(req): Parameters<FocusFunctionRequest>,
     ) -> Result<Json<FocusFunctionResult>, String> {
         let cached = self.get_profile(&req.path)?;
-        let selected = select_thread(&cached.profile, &req.thread, &req.tid, req.thread_index)?;
-        let thread = selected.thread;
+        let selection = select_thread_indices_for_single_or_prefix_scope(
+            &cached.profile,
+            &req.thread,
+            &req.tid,
+            req.thread_index,
+            &req.thread_name_prefix,
+            &req.thread_name_prefixes,
+        )?;
+        let thread_refs: Vec<&ResolvedThread> = selection
+            .thread_indices
+            .iter()
+            .filter_map(|index| cached.profile.threads.get(*index))
+            .collect();
 
-        let function_name = resolve_function_name(
+        let function_name = resolve_function_name_in_threads(
             &cached.cache.function_stats,
             req.query.as_deref(),
             req.function_id.as_deref(),
             &req.match_mode,
-            Some(selected.index),
+            Some(&selection.thread_indices),
         )
         .ok_or_else(|| {
             format!(
-                "Function not found in thread {}. Provide function_id or query; try profile_search_functions first.",
-                thread_label(selected.index, thread)
+                "Function not found in scope {}. Provide function_id or query; try profile_search_functions first.",
+                selection.scope
             )
         })?;
 
         let exclude_framework =
             exclude_framework_enabled(req.exclude_framework, req.user_code_only);
-        let focused = call_tree::build_focused_call_tree_with_filter(
-            thread,
+        let frame_filter = FrameNameFilter::new(
+            &req.include,
+            &req.exclude,
+            &req.include_regex,
+            &req.exclude_regex,
+            exclude_framework,
+        )?;
+        let focused = call_tree::build_focused_call_tree_for_threads_with_filter(
+            &thread_refs,
             &function_name,
             req.max_depth,
             req.min_percent,
-            |name| !exclude_framework || !symbols::is_framework_function(name, None),
+            |name| frame_filter.includes(name),
         )
         .ok_or_else(|| {
             format!(
-                "Function '{}' did not appear in any samples on thread {}",
-                function_name,
-                thread_label(selected.index, thread)
+                "Function '{}' did not appear in any samples in scope {}",
+                function_name, selection.scope
             )
         })?;
         let text = focused
             .tree
             .render_text_with_options(req.max_depth, req.short_names, true);
+        let summary = thread_sample_summary(&cached.profile, &selection.thread_indices);
+        let (thread, tid, thread_index) = if let Some(selected_thread) = &selection.selected_thread
+        {
+            (
+                Some(selected_thread.thread.name.clone()),
+                Some(selected_thread.thread.tid.clone()),
+                Some(selected_thread.index),
+            )
+        } else {
+            (None, None, None)
+        };
 
         Ok(Json(FocusFunctionResult {
-            thread: thread.name.clone(),
-            tid: thread.tid.clone(),
-            thread_index: selected.index,
+            scope: selection.scope,
+            thread,
+            tid,
+            thread_index,
+            thread_count: selection.thread_indices.len(),
+            threads: if req.include_threads {
+                thread_infos(&cached.profile, &selection.thread_indices)
+            } else {
+                Vec::new()
+            },
             function_id: symbols::function_id(&function_name),
             display_name: symbols::compact_function_name(&function_name),
             function_name,
             matched_samples: focused.sample_count,
             total_thread_samples: focused.total_samples,
+            total_scope_samples: focused.total_samples,
+            wall_time_ms: round2(summary.wall_time_ms),
+            cpu_sample_time_ms: round2(summary.cpu_sample_time_ms),
+            cpu_sample_percent_of_wall: round2(summary.cpu_sample_percent_of_wall),
+            samples_per_second: round2(summary.samples_per_second),
             focused_percent: round2(focused.focused_percent),
             focused_time_ms: round2(focused.focused_time_ms),
             tree: text,
@@ -1830,6 +2460,13 @@ impl ProfileServer {
             .collect();
         let exclude_framework =
             exclude_framework_enabled(req.exclude_framework, req.user_code_only);
+        let frame_filter = FrameNameFilter::new(
+            &req.include,
+            &req.exclude,
+            &req.include_regex,
+            &req.exclude_regex,
+            exclude_framework,
+        )?;
         let focused = call_tree::build_focused_call_tree_under_caller_with_filter(
             &thread_refs,
             &function_name,
@@ -1837,7 +2474,7 @@ impl ProfileServer {
             caller_relationship,
             req.max_depth,
             req.min_percent,
-            |name| !exclude_framework || !symbols::is_framework_function(name, None),
+            |name| frame_filter.includes(name),
         )
         .ok_or_else(|| {
             format!(
@@ -1848,12 +2485,21 @@ impl ProfileServer {
         let tree = focused
             .tree
             .render_text_with_options(req.max_depth, req.short_names, true);
+        let summary = thread_sample_summary(profile, &thread_indices);
 
         Ok(Json(FunctionUnderCallerResult {
             scope,
             thread_count: thread_indices.len(),
-            threads: thread_infos(profile, &thread_indices),
-            matched_threads: thread_infos(profile, &metrics.matched_thread_indices),
+            threads: if req.include_threads {
+                thread_infos(profile, &thread_indices)
+            } else {
+                Vec::new()
+            },
+            matched_threads: if req.include_threads {
+                thread_infos(profile, &metrics.matched_thread_indices)
+            } else {
+                Vec::new()
+            },
             function_id: symbols::function_id(&function_name),
             display_name: symbols::compact_function_name(&function_name),
             function_name,
@@ -1865,6 +2511,10 @@ impl ProfileServer {
             descendant_time_ms: round2(metrics.descendant_time_ms),
             caller_context_time_ms: round2(metrics.caller_context_time_ms),
             scope_time_ms: round2(metrics.scope_time_ms),
+            wall_time_ms: round2(summary.wall_time_ms),
+            cpu_sample_time_ms: round2(summary.cpu_sample_time_ms),
+            cpu_sample_percent_of_wall: round2(summary.cpu_sample_percent_of_wall),
+            samples_per_second: round2(summary.samples_per_second),
             exclusive_percent_of_scope: round2(percent(
                 metrics.exclusive_time_ms,
                 metrics.scope_time_ms,
