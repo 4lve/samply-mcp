@@ -1,4 +1,4 @@
-use super::types::{RawProfile, RawThread};
+use super::types::{RawMarkerSchema, RawProfile, RawThread};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedProfile {
@@ -43,6 +43,7 @@ pub struct ResolvedMarker {
     pub name: String,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
+    pub phase: Option<u8>,
     pub category: String,
     pub data: Option<serde_json::Value>,
 }
@@ -71,7 +72,13 @@ impl ResolvedProfile {
                 &shared_strings
             };
 
-            let resolved = resolve_thread(raw_thread, strings, &categories, &raw.libs);
+            let resolved = resolve_thread(
+                raw_thread,
+                strings,
+                &categories,
+                &raw.libs,
+                &raw.meta.marker_schema,
+            );
             total_sample_count += resolved.samples.len();
 
             if let (Some(first), Some(last)) = (resolved.samples.first(), resolved.samples.last()) {
@@ -104,6 +111,7 @@ fn resolve_thread(
     strings: &[String],
     categories: &[String],
     libs: &[super::types::RawLib],
+    marker_schema: &[RawMarkerSchema],
 ) -> ResolvedThread {
     let str_at = |idx: usize| -> String {
         strings
@@ -289,6 +297,11 @@ fn resolve_thread(
                 .as_ref()
                 .and_then(|t| t.get(i).copied().flatten());
 
+            let phase = marker_table
+                .phase
+                .as_ref()
+                .and_then(|phases| phases.get(i).copied());
+
             let cat = marker_table
                 .category
                 .as_ref()
@@ -296,15 +309,17 @@ fn resolve_thread(
                 .map(&category_name)
                 .unwrap_or_else(|| "Other".to_string());
 
-            let data = marker_table
+            let mut data = marker_table
                 .data
                 .as_ref()
                 .and_then(|d| d.get(i).cloned().flatten());
+            resolve_marker_strings(&mut data, marker_schema, strings);
 
             markers.push(ResolvedMarker {
                 name,
                 start_time,
                 end_time,
+                phase,
                 category: cat,
                 data,
             });
@@ -337,5 +352,40 @@ fn resolve_thread(
         samples,
         markers,
         duration_ms,
+    }
+}
+
+fn resolve_marker_strings(
+    data: &mut Option<serde_json::Value>,
+    marker_schema: &[RawMarkerSchema],
+    strings: &[String],
+) {
+    let Some(serde_json::Value::Object(data)) = data else {
+        return;
+    };
+    let Some(marker_type) = data.get("type").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let Some(schema) = marker_schema
+        .iter()
+        .find(|schema| schema.name == marker_type)
+    else {
+        return;
+    };
+
+    for field in &schema.data {
+        if field.format.as_deref() != Some("unique-string") {
+            continue;
+        }
+        let Some(key) = field.key.as_deref() else {
+            continue;
+        };
+        let Some(index) = data.get(key).and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(value) = strings.get(index as usize) else {
+            continue;
+        };
+        data.insert(key.to_string(), serde_json::Value::String(value.clone()));
     }
 }

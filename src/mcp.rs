@@ -14,6 +14,7 @@ use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router}
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::call_tree;
+use crate::analysis::context_switch;
 use crate::analysis::flamegraph;
 use crate::analysis::functions::{self, FunctionStats};
 use crate::analysis::symbols;
@@ -110,10 +111,10 @@ impl ProfileServer {
 
         {
             let cache = self.profiles.lock().unwrap();
-            if let Some(cached) = cache.get(&canonical) {
-                if cached.fingerprint == fingerprint {
-                    return Ok(Arc::clone(cached));
-                }
+            if let Some(cached) = cache.get(&canonical)
+                && cached.fingerprint == fingerprint
+            {
+                return Ok(Arc::clone(cached));
             }
         }
 
@@ -1170,6 +1171,46 @@ fn default_marker_limit() -> usize {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ContextSwitchesRequest {
+    #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
+    pub path: String,
+
+    #[schemars(
+        description = "Thread name. If multiple threads have this name, the one with the most samples is used."
+    )]
+    #[serde(default)]
+    pub thread: Option<String>,
+
+    #[schemars(description = "Thread id. Prefer this when profile_threads shows duplicate names.")]
+    #[serde(default)]
+    pub tid: Option<String>,
+
+    #[schemars(description = "Zero-based thread index from profile_threads.")]
+    #[serde(default)]
+    pub thread_index: Option<usize>,
+
+    #[schemars(
+        description = "Optional inclusive analysis window start timestamp in milliseconds."
+    )]
+    #[serde(default)]
+    pub start_time_ms: Option<f64>,
+
+    #[schemars(description = "Optional inclusive analysis window end timestamp in milliseconds.")]
+    #[serde(default)]
+    pub end_time_ms: Option<f64>,
+
+    #[schemars(
+        description = "Maximum number of longest off-CPU intervals to return (default: 20, maximum: 200)."
+    )]
+    #[serde(default = "default_context_switch_limit")]
+    pub limit: usize,
+}
+
+fn default_context_switch_limit() -> usize {
+    20
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FlamegraphRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
@@ -1668,6 +1709,7 @@ pub struct MarkerInfo {
     pub name: String,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
+    pub phase: Option<u8>,
     pub category: String,
     pub data: Option<serde_json::Value>,
 }
@@ -1678,6 +1720,50 @@ pub struct MarkersResult {
     pub tid: String,
     pub thread_index: usize,
     pub markers: Vec<MarkerInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContextSwitchCpuUsage {
+    pub cpu: String,
+    pub interval_count: usize,
+    pub on_cpu_time_ms: f64,
+    pub on_cpu_percent: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContextSwitchReasonSummary {
+    pub reason: String,
+    pub switch_count: usize,
+    pub observed_off_cpu_time_ms: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OffCpuIntervalInfo {
+    pub start_time_ms: f64,
+    pub end_time_ms: f64,
+    pub duration_ms: f64,
+    pub reason: String,
+    pub previous_cpu: String,
+    pub next_cpu: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContextSwitchesResult {
+    pub thread: String,
+    pub tid: String,
+    pub thread_index: usize,
+    pub observed_start_time_ms: f64,
+    pub observed_end_time_ms: f64,
+    pub observed_duration_ms: f64,
+    pub on_cpu_time_ms: f64,
+    pub off_cpu_time_ms: f64,
+    pub on_cpu_percent: f64,
+    pub off_cpu_percent: f64,
+    pub on_cpu_interval_count: usize,
+    pub switch_out_count: usize,
+    pub cpus: Vec<ContextSwitchCpuUsage>,
+    pub switch_out_reasons: Vec<ContextSwitchReasonSummary>,
+    pub longest_off_cpu_intervals: Vec<OffCpuIntervalInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2558,6 +2644,7 @@ impl ProfileServer {
                 name: m.name.clone(),
                 start_time: m.start_time,
                 end_time: m.end_time,
+                phase: m.phase,
                 category: m.category.clone(),
                 data: m.data.clone(),
             })
@@ -2568,6 +2655,92 @@ impl ProfileServer {
             tid: thread.tid.clone(),
             thread_index: selected.index,
             markers,
+        }))
+    }
+
+    #[tool(
+        description = "Analyze Samply context-switch markers for one thread: on/off-CPU time, CPU migration, blocked/preempted switch-outs, and the longest observed off-CPU intervals. Record with --per-cpu-threads --cswitch-markers."
+    )]
+    fn profile_context_switches(
+        &self,
+        Parameters(req): Parameters<ContextSwitchesRequest>,
+    ) -> Result<Json<ContextSwitchesResult>, String> {
+        if req.start_time_ms.is_some_and(|value| !value.is_finite())
+            || req.end_time_ms.is_some_and(|value| !value.is_finite())
+        {
+            return Err("start_time_ms and end_time_ms must be finite numbers".to_string());
+        }
+        if let (Some(start), Some(end)) = (req.start_time_ms, req.end_time_ms)
+            && end <= start
+        {
+            return Err("end_time_ms must be greater than start_time_ms".to_string());
+        }
+
+        let cached = self.get_profile(&req.path)?;
+        let selected = select_thread(&cached.profile, &req.thread, &req.tid, req.thread_index)?;
+        let thread = selected.thread;
+        let analysis = context_switch::analyze_context_switches(
+            thread,
+            req.start_time_ms,
+            req.end_time_ms,
+            req.limit.min(200),
+        )
+        .ok_or_else(|| {
+            format!(
+                "No usable OnCpu context-switch intervals found for {}. Record the profile with `samply record --per-cpu-threads --cswitch-markers ...` and select an application thread.",
+                thread_label(selected.index, thread)
+            )
+        })?;
+
+        let observed_duration_ms = analysis.observed_duration_ms;
+        let cpus = analysis
+            .cpus
+            .into_iter()
+            .map(|cpu| ContextSwitchCpuUsage {
+                cpu: cpu.cpu,
+                interval_count: cpu.interval_count,
+                on_cpu_time_ms: round2(cpu.on_cpu_time_ms),
+                on_cpu_percent: round2(percent(cpu.on_cpu_time_ms, observed_duration_ms)),
+            })
+            .collect();
+        let switch_out_reasons = analysis
+            .switch_out_reasons
+            .into_iter()
+            .map(|reason| ContextSwitchReasonSummary {
+                reason: reason.reason,
+                switch_count: reason.switch_count,
+                observed_off_cpu_time_ms: round2(reason.observed_off_cpu_time_ms),
+            })
+            .collect();
+        let longest_off_cpu_intervals = analysis
+            .longest_off_cpu_intervals
+            .into_iter()
+            .map(|interval| OffCpuIntervalInfo {
+                start_time_ms: round2(interval.start_time_ms),
+                end_time_ms: round2(interval.end_time_ms),
+                duration_ms: round2(interval.duration_ms),
+                reason: interval.reason,
+                previous_cpu: interval.previous_cpu,
+                next_cpu: interval.next_cpu,
+            })
+            .collect();
+
+        Ok(Json(ContextSwitchesResult {
+            thread: thread.name.clone(),
+            tid: thread.tid.clone(),
+            thread_index: selected.index,
+            observed_start_time_ms: round2(analysis.observed_start_time_ms),
+            observed_end_time_ms: round2(analysis.observed_end_time_ms),
+            observed_duration_ms: round2(observed_duration_ms),
+            on_cpu_time_ms: round2(analysis.on_cpu_time_ms),
+            off_cpu_time_ms: round2(analysis.off_cpu_time_ms),
+            on_cpu_percent: round2(percent(analysis.on_cpu_time_ms, observed_duration_ms)),
+            off_cpu_percent: round2(percent(analysis.off_cpu_time_ms, observed_duration_ms)),
+            on_cpu_interval_count: analysis.on_cpu_interval_count,
+            switch_out_count: analysis.switch_out_count,
+            cpus,
+            switch_out_reasons,
+            longest_off_cpu_intervals,
         }))
     }
 
@@ -2667,7 +2840,8 @@ impl ServerHandler for ProfileServer {
                  time when a function appears under a specific caller/ancestor, \
                  profile_call_tree for full hierarchical call analysis, \
                  profile_function_detail for callers/callees, profile_markers for timeline \
-                 events, and profile_flamegraph for collapsed stack output. Prefer \
+                 events, profile_context_switches for on/off-CPU and scheduling analysis, \
+                 and profile_flamegraph for collapsed stack output. Prefer \
                  exclude_framework=true or user_code_only=true for Rust/Criterion profiles. \
                  Result rows include display_name for compact Rust symbols and source when \
                  file/line data is present. Focused trees show both focus and thread percentages."
@@ -2773,6 +2947,55 @@ mod tests {
         )
     }
 
+    fn context_switch_profile_json() -> String {
+        r#"{
+            "meta": {
+                "categories": [{ "name": "Other", "color": "grey", "subcategories": [] }],
+                "interval": 1,
+                "product": "test",
+                "markerSchema": [{
+                    "name": "OnCpu",
+                    "display": ["marker-chart", "marker-table"],
+                    "data": [
+                        {"key": "cpu", "label": "CPU", "format": "unique-string"},
+                        {"key": "outwhy", "label": "Switch-out reason", "format": "unique-string"}
+                    ]
+                }]
+            },
+            "libs": [],
+            "threads": [{
+                "name": "worker",
+                "isMainThread": true,
+                "pid": 1,
+                "tid": 2,
+                "unregisterTime": null,
+                "frameTable": { "length": 1, "func": [0], "category": [0] },
+                "funcTable": { "length": 1, "name": [0] },
+                "stackTable": { "length": 1, "prefix": [null], "frame": [0] },
+                "samples": { "length": 1, "stack": [0], "time": [0], "weight": [1] },
+                "markers": {
+                    "length": 3,
+                    "name": [1, 1, 1],
+                    "startTime": [0, 10, 15],
+                    "endTime": [4, 13, 20],
+                    "phase": [1, 1, 1],
+                    "category": [0, 0, 0],
+                    "data": [
+                        {"type": "OnCpu", "cpu": 2, "outwhy": 3},
+                        {"type": "OnCpu", "cpu": 4, "outwhy": 5},
+                        {"type": "OnCpu", "cpu": 2, "outwhy": 3}
+                    ]
+                },
+                "resourceTable": { "length": 0 },
+                "nativeSymbols": { "length": 0 },
+                "stringArray": [
+                    "root_function", "Running on CPU", "CPU 0", "blocked", "CPU 1", "preempted"
+                ]
+            }]
+        }"#
+        .to_string()
+    }
+
     fn write_profile(path: &Path, thread_name: &str) {
         std::fs::write(path, profile_json(thread_name)).unwrap();
     }
@@ -2857,6 +3080,42 @@ mod tests {
         let second = ProfileFingerprint::read(&profile_path).unwrap();
 
         assert_ne!(first, second);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn profile_context_switches_resolves_marker_strings_and_summarizes_intervals() {
+        let dir = unique_test_dir("context-switches");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("profile.json");
+        std::fs::write(&path, context_switch_profile_json()).unwrap();
+
+        let server = ProfileServer::new();
+        let cached = server.get_profile(path.to_str().unwrap()).unwrap();
+        let first_marker = &cached.profile.threads[0].markers[0];
+        assert_eq!(first_marker.phase, Some(1));
+        assert_eq!(first_marker.data.as_ref().unwrap()["cpu"], "CPU 0");
+        assert_eq!(first_marker.data.as_ref().unwrap()["outwhy"], "blocked");
+
+        let Json(result) = server
+            .profile_context_switches(Parameters(ContextSwitchesRequest {
+                path: path.to_string_lossy().into_owned(),
+                thread: None,
+                tid: None,
+                thread_index: Some(0),
+                start_time_ms: None,
+                end_time_ms: None,
+                limit: 10,
+            }))
+            .unwrap();
+
+        assert_eq!(result.thread, "worker");
+        assert_eq!(result.on_cpu_time_ms, 12.0);
+        assert_eq!(result.off_cpu_time_ms, 8.0);
+        assert_eq!(result.cpus[0].cpu, "CPU 0");
+        assert_eq!(result.longest_off_cpu_intervals[0].reason, "blocked");
+        assert_eq!(result.longest_off_cpu_intervals[0].duration_ms, 6.0);
 
         std::fs::remove_dir_all(dir).unwrap();
     }

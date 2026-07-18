@@ -31,6 +31,7 @@ Every tool accepts a `path` parameter, so one server installation works for any 
 | `profile_call_tree` | Hierarchical call tree with optional `exclude_framework`/`user_code_only` pruning |
 | `profile_function_detail` | Callers, callees, and source locations for a specific function |
 | `profile_markers` | Timeline markers and events |
+| `profile_context_switches` | On/off-CPU time, CPU migration, switch-out reasons, and longest scheduling gaps |
 | `profile_flamegraph` | Collapsed stack format, optionally sliced from a focused function |
 
 All tools require a `path` parameter pointing to a profile `.json` or `.json.gz` file. Profiles are loaded on first use and cached in memory.
@@ -57,6 +58,15 @@ samply record --save-only --unstable-presymbolicate -o profile.json.gz -- ./targ
 ```
 
 This produces `profile.json.gz` (and `profile.json.syms.json` alongside it). samply-mcp picks up the sidecar automatically — no manual symbolication needed.
+
+For scheduler and blocking analysis, record context-switch markers and per-CPU tracks together:
+
+```bash
+samply record --save-only --per-cpu-threads --cswitch-markers \
+  --unstable-presymbolicate -o profile.json.gz -- ./target/profiling/my-program
+```
+
+Then use `profile_context_switches` on an application thread. It reports observed on/off-CPU time, CPU usage and migration, `blocked` versus `preempted` switch-outs, and the longest off-CPU intervals. Off-CPU time following `blocked` includes the application's wait plus any delay before it runs again; context-switch markers alone cannot separate those two portions.
 
 ## Installation
 

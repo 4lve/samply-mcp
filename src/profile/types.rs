@@ -63,7 +63,16 @@ pub struct RawMarkerSchema {
     #[serde(default)]
     pub display: Vec<serde_json::Value>,
     #[serde(default)]
-    pub data: Vec<serde_json::Value>,
+    pub data: Vec<RawMarkerSchemaField>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawMarkerSchemaField {
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
