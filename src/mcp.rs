@@ -17,6 +17,7 @@ use crate::analysis::call_tree;
 use crate::analysis::context_switch;
 use crate::analysis::flamegraph;
 use crate::analysis::functions::{self, FunctionStats};
+use crate::analysis::samples::{self, AnalysisRange};
 use crate::analysis::symbols;
 use crate::profile::parse::{find_syms_sidecar, load_profile};
 use crate::profile::resolved::{ResolvedProfile, ResolvedThread};
@@ -32,7 +33,7 @@ impl AnalysisCache {
         let function_stats = profile
             .threads
             .iter()
-            .map(functions::compute_function_stats)
+            .map(|thread| functions::compute_function_stats(thread, profile.interval_ms, None))
             .collect();
         AnalysisCache { function_stats }
     }
@@ -190,6 +191,49 @@ fn select_thread<'a>(
                 .max_by_key(|(_, t)| t.samples.len())
         })
         .ok_or("No threads found")?;
+
+    Ok(SelectedThread { index, thread })
+}
+
+fn select_sample_thread<'a>(
+    profile: &'a ResolvedProfile,
+    thread_name: &Option<String>,
+    tid: &Option<String>,
+    thread_index: Option<usize>,
+    range: &AnalysisRange,
+) -> Result<SelectedThread<'a>, String> {
+    if thread_index.is_some() || tid.is_some() {
+        return select_thread(profile, thread_name, tid, thread_index);
+    }
+
+    if let Some(name) = thread_name {
+        let (index, thread) = profile
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.name == *name)
+            .filter(|(_, candidate)| samples::sample_count(candidate, Some(range)) > 0)
+            .max_by_key(|(_, candidate)| samples::sample_count(candidate, Some(range)))
+            .ok_or_else(|| format!("Thread '{name}' has no samples in the selected time range"))?;
+        return Ok(SelectedThread { index, thread });
+    }
+
+    let (index, thread) = profile
+        .threads
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.is_main)
+        .filter(|(_, candidate)| samples::sample_count(candidate, Some(range)) > 0)
+        .max_by_key(|(_, candidate)| samples::sample_count(candidate, Some(range)))
+        .or_else(|| {
+            profile
+                .threads
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| samples::sample_count(candidate, Some(range)) > 0)
+                .max_by_key(|(_, candidate)| samples::sample_count(candidate, Some(range)))
+        })
+        .ok_or("No sampled threads found in the selected time range")?;
 
     Ok(SelectedThread { index, thread })
 }
@@ -457,18 +501,23 @@ struct ThreadSampleSummary {
 fn thread_sample_summary(
     profile: &ResolvedProfile,
     thread_indices: &[usize],
+    range: Option<&AnalysisRange>,
 ) -> ThreadSampleSummary {
     let sample_count: usize = thread_indices
         .iter()
         .filter_map(|index| profile.threads.get(*index))
-        .map(|thread| thread.samples.len())
+        .map(|thread| samples::sample_count(thread, range))
         .sum();
     let wall_time_ms: f64 = thread_indices
         .iter()
         .filter_map(|index| profile.threads.get(*index))
-        .map(|thread| thread.duration_ms)
+        .map(|thread| samples::thread_wall_time_ms(thread, range))
         .sum();
-    let cpu_sample_time_ms = profile.interval_ms * sample_count as f64;
+    let cpu_sample_time_ms = thread_indices
+        .iter()
+        .filter_map(|index| profile.threads.get(*index))
+        .map(|thread| samples::thread_sample_time_ms(thread, profile.interval_ms, range))
+        .sum();
     let samples_per_second = if wall_time_ms > 0.0 {
         sample_count as f64 / wall_time_ms * 1000.0
     } else {
@@ -484,16 +533,21 @@ fn thread_sample_summary(
     }
 }
 
-fn thread_info(profile: &ResolvedProfile, index: usize, thread: &ResolvedThread) -> ThreadInfo {
-    let summary = thread_sample_summary(profile, &[index]);
+fn thread_info(
+    profile: &ResolvedProfile,
+    index: usize,
+    thread: &ResolvedThread,
+    range: Option<&AnalysisRange>,
+) -> ThreadInfo {
+    let summary = thread_sample_summary(profile, &[index], range);
 
     ThreadInfo {
         index,
         name: thread.name.clone(),
         pid: thread.pid.clone(),
         tid: thread.tid.clone(),
-        sample_count: thread.samples.len(),
-        duration_ms: thread.duration_ms,
+        sample_count: summary.sample_count,
+        duration_ms: round2(summary.wall_time_ms),
         wall_time_ms: round2(summary.wall_time_ms),
         cpu_sample_time_ms: round2(summary.cpu_sample_time_ms),
         cpu_sample_percent_of_wall: round2(summary.cpu_sample_percent_of_wall),
@@ -502,17 +556,22 @@ fn thread_info(profile: &ResolvedProfile, index: usize, thread: &ResolvedThread)
     }
 }
 
-fn thread_infos(profile: &ResolvedProfile, thread_indices: &[usize]) -> Vec<ThreadInfo> {
+fn thread_infos(
+    profile: &ResolvedProfile,
+    thread_indices: &[usize],
+    range: Option<&AnalysisRange>,
+) -> Vec<ThreadInfo> {
     thread_indices
         .iter()
         .filter_map(|index| profile.threads.get(*index).map(|thread| (*index, thread)))
-        .map(|(index, thread)| thread_info(profile, index, thread))
+        .map(|(index, thread)| thread_info(profile, index, thread, range))
         .collect()
 }
 
 fn thread_summary_groups(
     profile: &ResolvedProfile,
     thread_indices: &[usize],
+    range: Option<&AnalysisRange>,
 ) -> Vec<ThreadSummaryGroup> {
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
 
@@ -529,11 +588,11 @@ fn thread_summary_groups(
     let mut summaries: Vec<ThreadSummaryGroup> = groups
         .into_iter()
         .map(|(name_prefix, indices)| {
-            let summary = thread_sample_summary(profile, &indices);
+            let summary = thread_sample_summary(profile, &indices, range);
             let max_thread_duration_ms = indices
                 .iter()
                 .filter_map(|index| profile.threads.get(*index))
-                .map(|thread| thread.duration_ms)
+                .map(|thread| samples::thread_wall_time_ms(thread, range))
                 .fold(0.0, f64::max);
             let main_thread_count = indices
                 .iter()
@@ -563,33 +622,74 @@ fn thread_summary_groups(
     summaries
 }
 
-fn scope_total_time_ms(profile: &ResolvedProfile, thread_indices: &[usize]) -> f64 {
+fn scope_total_time_ms(
+    profile: &ResolvedProfile,
+    thread_indices: &[usize],
+    range: Option<&AnalysisRange>,
+) -> f64 {
     thread_indices
         .iter()
         .filter_map(|index| profile.threads.get(*index))
-        .map(|thread| call_tree::sample_interval_ms(thread) * thread.samples.len() as f64)
+        .map(|thread| samples::thread_sample_time_ms(thread, profile.interval_ms, range))
         .sum()
+}
+
+fn function_stats_for_thread(
+    cached: &CachedProfile,
+    thread_index: usize,
+    range: &AnalysisRange,
+) -> Vec<FunctionStats> {
+    if range.is_full_profile(&cached.profile) {
+        return cached
+            .cache
+            .function_stats
+            .get(thread_index)
+            .cloned()
+            .unwrap_or_default();
+    }
+
+    cached
+        .profile
+        .threads
+        .get(thread_index)
+        .map(|thread| {
+            functions::compute_function_stats(thread, cached.profile.interval_ms, Some(range))
+        })
+        .unwrap_or_default()
+}
+
+fn function_stats_for_threads(
+    cached: &CachedProfile,
+    thread_indices: &[usize],
+    range: &AnalysisRange,
+) -> Vec<Vec<FunctionStats>> {
+    let mut stats = vec![Vec::new(); cached.profile.threads.len()];
+    for index in thread_indices {
+        if *index < stats.len() {
+            stats[*index] = function_stats_for_thread(cached, *index, range);
+        }
+    }
+    stats
 }
 
 fn aggregate_function_stats(
     cached: &CachedProfile,
     thread_indices: &[usize],
+    range: &AnalysisRange,
 ) -> (Vec<FunctionStats>, f64, usize) {
-    let total_time_ms = scope_total_time_ms(&cached.profile, thread_indices);
+    let total_time_ms = scope_total_time_ms(&cached.profile, thread_indices, Some(range));
     let total_samples = thread_indices
         .iter()
         .filter_map(|index| cached.profile.threads.get(*index))
-        .map(|thread| thread.samples.len())
+        .map(|thread| samples::sample_count(thread, Some(range)))
         .sum();
 
     let mut by_name: HashMap<String, AggregatedFunctionStatsAccum> = HashMap::new();
 
     for index in thread_indices {
-        let Some(stats) = cached.cache.function_stats.get(*index) else {
-            continue;
-        };
+        let stats = function_stats_for_thread(cached, *index, range);
 
-        for stat in stats {
+        for stat in &stats {
             let entry = by_name.entry(stat.name.clone()).or_default();
             entry.self_time_ms += stat.self_time_ms;
             entry.total_time_ms += stat.total_time_ms;
@@ -642,6 +742,7 @@ fn select_thread_indices_for_scope(
     thread_index: Option<usize>,
     thread_name_prefix: &Option<String>,
     thread_name_prefixes: &[String],
+    range: &AnalysisRange,
 ) -> Result<(String, Vec<usize>), String> {
     let prefixes = requested_thread_prefixes(thread_name_prefix, thread_name_prefixes);
     let has_explicit_thread_selector = thread.is_some() || tid.is_some() || thread_index.is_some();
@@ -653,7 +754,7 @@ fn select_thread_indices_for_scope(
     }
 
     if has_explicit_thread_selector {
-        let selected = select_thread(profile, thread, tid, thread_index)?;
+        let selected = select_sample_thread(profile, thread, tid, thread_index, range)?;
         return Ok((
             thread_label(selected.index, selected.thread),
             vec![selected.index],
@@ -666,6 +767,7 @@ fn select_thread_indices_for_scope(
             if prefixes
                 .iter()
                 .any(|prefix| thread_name_matches_prefix(&thread.name, prefix))
+                && samples::sample_count(thread, Some(range)) > 0
             {
                 indices.push(index);
             }
@@ -688,7 +790,7 @@ fn select_thread_indices_for_scope(
         .threads
         .iter()
         .enumerate()
-        .filter(|(_, thread)| !thread.samples.is_empty())
+        .filter(|(_, thread)| samples::sample_count(thread, Some(range)) > 0)
         .map(|(index, _)| index)
         .collect();
 
@@ -712,6 +814,7 @@ fn select_thread_indices_for_single_or_prefix_scope<'a>(
     thread_index: Option<usize>,
     thread_name_prefix: &Option<String>,
     thread_name_prefixes: &[String],
+    range: &AnalysisRange,
 ) -> Result<ThreadScopeSelection<'a>, String> {
     let prefixes = requested_thread_prefixes(thread_name_prefix, thread_name_prefixes);
     let has_explicit_thread_selector = thread.is_some() || tid.is_some() || thread_index.is_some();
@@ -728,6 +831,7 @@ fn select_thread_indices_for_single_or_prefix_scope<'a>(
             if prefixes
                 .iter()
                 .any(|prefix| thread_name_matches_prefix(&thread.name, prefix))
+                && samples::sample_count(thread, Some(range)) > 0
             {
                 thread_indices.push(index);
             }
@@ -747,7 +851,7 @@ fn select_thread_indices_for_single_or_prefix_scope<'a>(
         });
     }
 
-    let selected = select_thread(profile, thread, tid, thread_index)?;
+    let selected = select_sample_thread(profile, thread, tid, thread_index, range)?;
     let scope = thread_label(selected.index, selected.thread);
     let thread_indices = vec![selected.index];
 
@@ -789,12 +893,13 @@ struct FunctionUnderCallerMetrics {
 fn compute_function_under_caller_metrics(
     profile: &ResolvedProfile,
     thread_indices: &[usize],
+    range: &AnalysisRange,
     function_name: &str,
     caller_name: &str,
     caller_relationship: call_tree::CallerRelationship,
 ) -> FunctionUnderCallerMetrics {
     let mut metrics = FunctionUnderCallerMetrics {
-        scope_time_ms: scope_total_time_ms(profile, thread_indices),
+        scope_time_ms: scope_total_time_ms(profile, thread_indices, Some(range)),
         ..Default::default()
     };
 
@@ -802,10 +907,14 @@ fn compute_function_under_caller_metrics(
         let Some(thread) = profile.threads.get(*index) else {
             continue;
         };
-        let interval_ms = call_tree::sample_interval_ms(thread);
         let mut thread_matched = false;
 
-        for sample in &thread.samples {
+        for sample in thread
+            .samples
+            .iter()
+            .filter(|sample| range.contains(sample))
+        {
+            let sample_time_ms = samples::sample_time_ms(thread, sample, profile.interval_ms);
             metrics.total_scope_samples += 1;
 
             if sample
@@ -813,7 +922,7 @@ fn compute_function_under_caller_metrics(
                 .iter()
                 .any(|frame| frame.function_name == caller_name)
             {
-                metrics.caller_context_time_ms += interval_ms;
+                metrics.caller_context_time_ms += sample_time_ms;
                 metrics.caller_context_samples += 1;
             }
 
@@ -826,12 +935,12 @@ fn compute_function_under_caller_metrics(
                 continue;
             };
 
-            metrics.descendant_time_ms += interval_ms;
+            metrics.descendant_time_ms += sample_time_ms;
             metrics.descendant_samples += 1;
             thread_matched = true;
 
             if function_index + 1 == sample.stack.len() {
-                metrics.exclusive_time_ms += interval_ms;
+                metrics.exclusive_time_ms += sample_time_ms;
                 metrics.exclusive_samples += 1;
             }
         }
@@ -864,6 +973,18 @@ pub struct ProfileInfoRequest {
 pub struct ProfileThreadsRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window start in profile-relative milliseconds; 0 is the first observed sample."
+    )]
+    #[serde(default)]
+    pub start_time_ms: Option<f64>,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window end in profile-relative milliseconds."
+    )]
+    #[serde(default)]
+    pub end_time_ms: Option<f64>,
 
     #[schemars(
         description = "Optional thread name prefix filter. A trailing '*' is accepted for convenience."
@@ -902,6 +1023,18 @@ pub struct ProfileThreadsRequest {
 pub struct TopFunctionsRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window start in profile-relative milliseconds; 0 is the first observed sample."
+    )]
+    #[serde(default)]
+    pub start_time_ms: Option<f64>,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window end in profile-relative milliseconds."
+    )]
+    #[serde(default)]
+    pub end_time_ms: Option<f64>,
 
     #[schemars(
         description = "Thread name to analyze. If multiple threads have this name, the one with the most samples is used."
@@ -956,6 +1089,18 @@ pub struct TopFunctionsRequest {
 pub struct ThreadGroupTopFunctionsRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window start in profile-relative milliseconds; 0 is the first observed sample."
+    )]
+    #[serde(default)]
+    pub start_time_ms: Option<f64>,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window end in profile-relative milliseconds."
+    )]
+    #[serde(default)]
+    pub end_time_ms: Option<f64>,
 
     #[schemars(
         description = "Thread name prefix to aggregate. A trailing '*' is accepted, e.g. rayon-gen-* matches names starting with rayon-gen-."
@@ -1020,6 +1165,18 @@ fn default_include_threads() -> bool {
 pub struct CallTreeRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window start in profile-relative milliseconds; 0 is the first observed sample."
+    )]
+    #[serde(default)]
+    pub start_time_ms: Option<f64>,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window end in profile-relative milliseconds."
+    )]
+    #[serde(default)]
+    pub end_time_ms: Option<f64>,
 
     #[schemars(
         description = "Thread name to analyze. If multiple threads have this name, the one with the most samples is used."
@@ -1127,6 +1284,18 @@ pub struct FunctionDetailRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
 
+    #[schemars(
+        description = "Optional inclusive analysis-window start in profile-relative milliseconds; 0 is the first observed sample."
+    )]
+    #[serde(default)]
+    pub start_time_ms: Option<f64>,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window end in profile-relative milliseconds."
+    )]
+    #[serde(default)]
+    pub end_time_ms: Option<f64>,
+
     #[schemars(description = "Full function name or substring to look up")]
     #[serde(default)]
     pub function_name: Option<String>,
@@ -1190,12 +1359,14 @@ pub struct ContextSwitchesRequest {
     pub thread_index: Option<usize>,
 
     #[schemars(
-        description = "Optional inclusive analysis window start timestamp in milliseconds."
+        description = "Optional inclusive analysis-window start in profile-relative milliseconds; 0 is the first observed sample."
     )]
     #[serde(default)]
     pub start_time_ms: Option<f64>,
 
-    #[schemars(description = "Optional inclusive analysis window end timestamp in milliseconds.")]
+    #[schemars(
+        description = "Optional inclusive analysis-window end in profile-relative milliseconds."
+    )]
     #[serde(default)]
     pub end_time_ms: Option<f64>,
 
@@ -1214,6 +1385,18 @@ fn default_context_switch_limit() -> usize {
 pub struct FlamegraphRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window start in profile-relative milliseconds; 0 is the first observed sample."
+    )]
+    #[serde(default)]
+    pub start_time_ms: Option<f64>,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window end in profile-relative milliseconds."
+    )]
+    #[serde(default)]
+    pub end_time_ms: Option<f64>,
 
     #[schemars(
         description = "Thread name. If multiple threads have this name, the one with the most samples is used."
@@ -1264,6 +1447,18 @@ pub struct FlamegraphRequest {
 pub struct SearchFunctionsRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window start in profile-relative milliseconds; 0 is the first observed sample."
+    )]
+    #[serde(default)]
+    pub start_time_ms: Option<f64>,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window end in profile-relative milliseconds."
+    )]
+    #[serde(default)]
+    pub end_time_ms: Option<f64>,
 
     #[schemars(description = "Function name substring or exact function name")]
     pub query: String,
@@ -1325,6 +1520,18 @@ fn default_search_sort_by() -> String {
 pub struct FocusFunctionRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window start in profile-relative milliseconds; 0 is the first observed sample."
+    )]
+    #[serde(default)]
+    pub start_time_ms: Option<f64>,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window end in profile-relative milliseconds."
+    )]
+    #[serde(default)]
+    pub end_time_ms: Option<f64>,
 
     #[schemars(description = "Full function name or substring to focus on")]
     #[serde(default)]
@@ -1421,6 +1628,18 @@ pub struct FocusFunctionRequest {
 pub struct FunctionUnderCallerRequest {
     #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
     pub path: String,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window start in profile-relative milliseconds; 0 is the first observed sample."
+    )]
+    #[serde(default)]
+    pub start_time_ms: Option<f64>,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window end in profile-relative milliseconds."
+    )]
+    #[serde(default)]
+    pub end_time_ms: Option<f64>,
 
     #[schemars(description = "Full function name or substring for the function being measured")]
     #[serde(default)]
@@ -1539,9 +1758,28 @@ fn default_caller_mode() -> String {
 
 // ── Response types ──
 
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EffectiveTimeRange {
+    /// Inclusive profile-relative start in milliseconds.
+    pub start_time_ms: f64,
+    /// Inclusive profile-relative end in milliseconds.
+    pub end_time_ms: f64,
+    pub duration_ms: f64,
+}
+
+fn effective_time_range(range: &AnalysisRange) -> EffectiveTimeRange {
+    EffectiveTimeRange {
+        start_time_ms: range.start_time_ms,
+        end_time_ms: range.end_time_ms,
+        duration_ms: range.duration_ms(),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProfileInfoResult {
     pub product: String,
+    /// Earliest observed sample timestamp in the profile's original clock domain.
+    pub observed_start_time_ms: f64,
     pub duration_ms: f64,
     pub total_samples: usize,
     pub thread_count: usize,
@@ -1566,6 +1804,7 @@ pub struct ThreadInfo {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProfileThreadsResult {
+    pub effective_range: EffectiveTimeRange,
     pub threads: Vec<ThreadInfo>,
     pub groups: Vec<ThreadSummaryGroup>,
 }
@@ -1601,6 +1840,7 @@ pub struct FunctionRow {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TopFunctionsResult {
+    pub effective_range: EffectiveTimeRange,
     pub thread: String,
     pub tid: String,
     pub thread_index: usize,
@@ -1610,6 +1850,7 @@ pub struct TopFunctionsResult {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ThreadGroupTopFunctionsResult {
+    pub effective_range: EffectiveTimeRange,
     pub groups: Vec<ThreadGroupTopFunctionsGroup>,
 }
 
@@ -1650,6 +1891,7 @@ pub struct FunctionSearchRow {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchFunctionsResult {
+    pub effective_range: EffectiveTimeRange,
     pub query: String,
     pub match_mode: String,
     pub functions: Vec<FunctionSearchRow>,
@@ -1665,6 +1907,7 @@ pub struct CallerCalleeEntry {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FunctionDetailResult {
+    pub effective_range: EffectiveTimeRange,
     pub function_id: String,
     pub function_name: String,
     pub display_name: String,
@@ -1684,6 +1927,7 @@ pub struct FunctionDetailResult {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CallTreeResult {
+    pub effective_range: EffectiveTimeRange,
     pub scope: String,
     pub thread: Option<String>,
     pub tid: Option<String>,
@@ -1749,6 +1993,7 @@ pub struct OffCpuIntervalInfo {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextSwitchesResult {
+    pub effective_range: EffectiveTimeRange,
     pub thread: String,
     pub tid: String,
     pub thread_index: usize,
@@ -1768,6 +2013,7 @@ pub struct ContextSwitchesResult {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FlamegraphResult {
+    pub effective_range: EffectiveTimeRange,
     pub thread: String,
     pub tid: String,
     pub thread_index: usize,
@@ -1779,6 +2025,7 @@ pub struct FlamegraphResult {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FocusFunctionResult {
+    pub effective_range: EffectiveTimeRange,
     pub scope: String,
     pub thread: Option<String>,
     pub tid: Option<String>,
@@ -1802,6 +2049,7 @@ pub struct FocusFunctionResult {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FunctionUnderCallerResult {
+    pub effective_range: EffectiveTimeRange,
     pub scope: String,
     pub thread_count: usize,
     pub threads: Vec<ThreadInfo>,
@@ -1837,7 +2085,7 @@ pub struct FunctionUnderCallerResult {
 #[tool_router]
 impl ProfileServer {
     #[tool(
-        description = "Get profile metadata: duration, sample count, thread count, sampling interval, and categories"
+        description = "Get profile metadata: duration, raw observed sample-clock start, sample count, thread count, sampling interval, and categories"
     )]
     fn profile_info(
         &self,
@@ -1848,6 +2096,7 @@ impl ProfileServer {
 
         Ok(Json(ProfileInfoResult {
             product: profile.product.clone(),
+            observed_start_time_ms: profile.observed_start_time_ms,
             duration_ms: profile.duration_ms,
             total_samples: profile.total_sample_count,
             thread_count: profile.threads.len(),
@@ -1865,6 +2114,7 @@ impl ProfileServer {
     ) -> Result<Json<ProfileThreadsResult>, String> {
         let cached = self.get_profile(&req.path)?;
         let profile = &cached.profile;
+        let range = AnalysisRange::resolve(profile, req.start_time_ms, req.end_time_ms)?;
         let prefixes =
             requested_thread_prefixes(&req.thread_name_prefix, &req.thread_name_prefixes);
         let thread_name_regex = compile_optional_regex(&req.thread_name_regex, "thread_name")?;
@@ -1889,13 +2139,13 @@ impl ProfileServer {
                 }
 
                 if let Some(min_samples) = req.min_samples
-                    && thread.samples.len() < min_samples
+                    && samples::sample_count(thread, Some(&range)) < min_samples
                 {
                     return false;
                 }
 
                 if let Some(min_duration_ms) = req.min_duration_ms
-                    && thread.duration_ms < min_duration_ms
+                    && samples::thread_wall_time_ms(thread, Some(&range)) < min_duration_ms
                 {
                     return false;
                 }
@@ -1905,17 +2155,21 @@ impl ProfileServer {
             .map(|(index, _)| index)
             .collect();
         let groups = if req.group_by_name_prefix {
-            thread_summary_groups(profile, &thread_indices)
+            thread_summary_groups(profile, &thread_indices, Some(&range))
         } else {
             Vec::new()
         };
         let threads = if req.include_threads {
-            thread_infos(profile, &thread_indices)
+            thread_infos(profile, &thread_indices, Some(&range))
         } else {
             Vec::new()
         };
 
-        Ok(Json(ProfileThreadsResult { threads, groups }))
+        Ok(Json(ProfileThreadsResult {
+            effective_range: effective_time_range(&range),
+            threads,
+            groups,
+        }))
     }
 
     #[tool(
@@ -1926,15 +2180,17 @@ impl ProfileServer {
         Parameters(req): Parameters<TopFunctionsRequest>,
     ) -> Result<Json<TopFunctionsResult>, String> {
         let cached = self.get_profile(&req.path)?;
-        let selected = select_thread(&cached.profile, &req.thread, &req.tid, req.thread_index)?;
+        let range = AnalysisRange::resolve(&cached.profile, req.start_time_ms, req.end_time_ms)?;
+        let selected = select_sample_thread(
+            &cached.profile,
+            &req.thread,
+            &req.tid,
+            req.thread_index,
+            &range,
+        )?;
         let thread = selected.thread;
 
-        let mut stats = cached
-            .cache
-            .function_stats
-            .get(selected.index)
-            .cloned()
-            .unwrap_or_default();
+        let mut stats = function_stats_for_thread(&cached, selected.index, &range);
 
         sort_function_stats(&mut stats, &req.sort_by);
         let exclude_framework =
@@ -1961,6 +2217,7 @@ impl ProfileServer {
             .collect();
 
         Ok(Json(TopFunctionsResult {
+            effective_range: effective_time_range(&range),
             thread: thread.name.clone(),
             tid: thread.tid.clone(),
             thread_index: selected.index,
@@ -1977,6 +2234,7 @@ impl ProfileServer {
         Parameters(req): Parameters<ThreadGroupTopFunctionsRequest>,
     ) -> Result<Json<ThreadGroupTopFunctionsResult>, String> {
         let cached = self.get_profile(&req.path)?;
+        let range = AnalysisRange::resolve(&cached.profile, req.start_time_ms, req.end_time_ms)?;
         let prefixes =
             requested_thread_prefixes(&req.thread_name_prefix, &req.thread_name_prefixes);
 
@@ -1998,7 +2256,10 @@ impl ProfileServer {
                 .threads
                 .iter()
                 .enumerate()
-                .filter(|(_, thread)| thread.name.starts_with(&normalized_prefix))
+                .filter(|(_, thread)| {
+                    thread.name.starts_with(&normalized_prefix)
+                        && samples::sample_count(thread, Some(&range)) > 0
+                })
                 .map(|(index, _)| index)
                 .collect();
 
@@ -2007,9 +2268,9 @@ impl ProfileServer {
             }
 
             let (mut stats, total_time_ms, sample_count) =
-                aggregate_function_stats(&cached, &thread_indices);
+                aggregate_function_stats(&cached, &thread_indices, &range);
             sort_function_stats(&mut stats, &req.sort_by);
-            let summary = thread_sample_summary(&cached.profile, &thread_indices);
+            let summary = thread_sample_summary(&cached.profile, &thread_indices, Some(&range));
 
             let functions = stats
                 .into_iter()
@@ -2045,7 +2306,7 @@ impl ProfileServer {
                 samples_per_second: round2(summary.samples_per_second),
                 sort_by: req.sort_by.clone(),
                 threads: if req.include_threads {
-                    thread_infos(&cached.profile, &thread_indices)
+                    thread_infos(&cached.profile, &thread_indices, Some(&range))
                 } else {
                     Vec::new()
                 },
@@ -2057,7 +2318,10 @@ impl ProfileServer {
             return Err("No threads matched the requested prefix group(s)".to_string());
         }
 
-        Ok(Json(ThreadGroupTopFunctionsResult { groups }))
+        Ok(Json(ThreadGroupTopFunctionsResult {
+            effective_range: effective_time_range(&range),
+            groups,
+        }))
     }
 
     #[tool(
@@ -2068,13 +2332,15 @@ impl ProfileServer {
         Parameters(req): Parameters<SearchFunctionsRequest>,
     ) -> Result<Json<SearchFunctionsResult>, String> {
         let cached = self.get_profile(&req.path)?;
+        let range = AnalysisRange::resolve(&cached.profile, req.start_time_ms, req.end_time_ms)?;
 
         let selected = if req.thread.is_some() || req.tid.is_some() || req.thread_index.is_some() {
-            Some(select_thread(
+            Some(select_sample_thread(
                 &cached.profile,
                 &req.thread,
                 &req.tid,
                 req.thread_index,
+                &range,
             )?)
         } else {
             None
@@ -2090,11 +2356,12 @@ impl ProfileServer {
                 continue;
             }
 
-            let Some(stats) = cached.cache.function_stats.get(index) else {
+            if samples::sample_count(thread, Some(&range)) == 0 {
                 continue;
-            };
+            }
+            let stats = function_stats_for_thread(&cached, index, &range);
 
-            for stat in stats {
+            for stat in &stats {
                 if !function_matches(&stat.name, &req.query, &req.match_mode)
                     || !function_passes_filters(stat, &req.include, &req.exclude, exclude_framework)
                 {
@@ -2129,6 +2396,7 @@ impl ProfileServer {
         rows.truncate(req.limit);
 
         Ok(Json(SearchFunctionsResult {
+            effective_range: effective_time_range(&range),
             query: req.query,
             match_mode: req.match_mode,
             functions: rows,
@@ -2144,8 +2412,17 @@ impl ProfileServer {
     ) -> Result<Json<FunctionDetailResult>, String> {
         let cached = self.get_profile(&req.path)?;
         let profile = &cached.profile;
+        let range = AnalysisRange::resolve(profile, req.start_time_ms, req.end_time_ms)?;
+        let thread_indices: Vec<usize> = profile
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, thread)| samples::sample_count(thread, Some(&range)) > 0)
+            .map(|(index, _)| index)
+            .collect();
+        let stats_by_thread = function_stats_for_threads(&cached, &thread_indices, &range);
         let target = resolve_function_name(
-            &cached.cache.function_stats,
+            &stats_by_thread,
             req.function_name.as_deref(),
             req.function_id.as_deref(),
             &req.match_mode,
@@ -2157,8 +2434,6 @@ impl ProfileServer {
 
         let mut total_self_time = 0.0;
         let mut total_total_time = 0.0;
-        let mut total_self_pct = 0.0;
-        let mut total_total_pct = 0.0;
         let mut total_samples = 0usize;
         let mut library = None;
         let mut file = None;
@@ -2169,13 +2444,11 @@ impl ProfileServer {
 
         for (thread_index, thread) in profile.threads.iter().enumerate() {
             // Check function stats
-            if let Some(stats) = cached.cache.function_stats.get(thread_index)
+            if let Some(stats) = stats_by_thread.get(thread_index)
                 && let Some(s) = stats.iter().find(|s| s.name == target)
             {
                 total_self_time += s.self_time_ms;
                 total_total_time += s.total_time_ms;
-                total_self_pct += s.self_percent;
-                total_total_pct += s.total_percent;
                 total_samples += s.sample_count;
                 if library.is_none() {
                     library = s.library.clone();
@@ -2190,7 +2463,11 @@ impl ProfileServer {
             }
 
             // Find callers and callees from actual stacks
-            for sample in &thread.samples {
+            for sample in thread
+                .samples
+                .iter()
+                .filter(|sample| range.contains(sample))
+            {
                 for (i, frame) in sample.stack.iter().enumerate() {
                     if frame.function_name == target {
                         // Caller is the previous frame in the stack
@@ -2235,15 +2512,17 @@ impl ProfileServer {
             })
             .collect();
         callees.sort_by_key(|entry| Reverse(entry.count));
+        let scope_time_ms = scope_total_time_ms(profile, &thread_indices, Some(&range));
 
         Ok(Json(FunctionDetailResult {
+            effective_range: effective_time_range(&range),
             function_id: symbols::function_id(&target),
             display_name: symbols::compact_function_name(&target),
             function_name: target,
             self_time_ms: round2(total_self_time),
             total_time_ms: round2(total_total_time),
-            self_percent: round2(total_self_pct),
-            total_percent: round2(total_total_pct),
+            self_percent: round2(percent(total_self_time, scope_time_ms)),
+            total_percent: round2(percent(total_total_time, scope_time_ms)),
             sample_count: total_samples,
             library,
             source: source_location(&file, line),
@@ -2263,6 +2542,7 @@ impl ProfileServer {
         Parameters(req): Parameters<CallTreeRequest>,
     ) -> Result<Json<CallTreeResult>, String> {
         let cached = self.get_profile(&req.path)?;
+        let range = AnalysisRange::resolve(&cached.profile, req.start_time_ms, req.end_time_ms)?;
         let selection = select_thread_indices_for_single_or_prefix_scope(
             &cached.profile,
             &req.thread,
@@ -2270,6 +2550,7 @@ impl ProfileServer {
             req.thread_index,
             &req.thread_name_prefix,
             &req.thread_name_prefixes,
+            &range,
         )?;
         let thread_refs: Vec<&ResolvedThread> = selection
             .thread_indices
@@ -2286,10 +2567,12 @@ impl ProfileServer {
             &req.exclude_regex,
             exclude_framework,
         )?;
+        let stats_by_thread =
+            function_stats_for_threads(&cached, &selection.thread_indices, &range);
         let focus_function = if req.focus_function.is_some() || req.focus_function_id.is_some() {
             Some(
                 resolve_function_name_in_threads(
-                    &cached.cache.function_stats,
+                    &stats_by_thread,
                     req.focus_function.as_deref(),
                     req.focus_function_id.as_deref(),
                     &req.match_mode,
@@ -2307,6 +2590,8 @@ impl ProfileServer {
             if let Some(function_name) = &focus_function {
                 let focused = call_tree::build_focused_call_tree_for_threads_with_filter(
                     &thread_refs,
+                    cached.profile.interval_ms,
+                    Some(&range),
                     function_name,
                     req.max_depth,
                     req.min_percent,
@@ -2329,6 +2614,8 @@ impl ProfileServer {
             } else {
                 let tree = call_tree::build_call_tree_for_threads_with_filter(
                     &thread_refs,
+                    cached.profile.interval_ms,
+                    Some(&range),
                     req.max_depth,
                     req.min_percent,
                     |name| frame_filter.includes(name),
@@ -2346,7 +2633,8 @@ impl ProfileServer {
         let focus_display_name = focus_function
             .as_ref()
             .map(|function_name| symbols::compact_function_name(function_name));
-        let summary = thread_sample_summary(&cached.profile, &selection.thread_indices);
+        let summary =
+            thread_sample_summary(&cached.profile, &selection.thread_indices, Some(&range));
         let (thread, tid, thread_index) = if let Some(selected_thread) = &selection.selected_thread
         {
             (
@@ -2359,6 +2647,7 @@ impl ProfileServer {
         };
 
         Ok(Json(CallTreeResult {
+            effective_range: effective_time_range(&range),
             scope: selection.scope,
             thread,
             tid,
@@ -2370,7 +2659,7 @@ impl ProfileServer {
             cpu_sample_percent_of_wall: round2(summary.cpu_sample_percent_of_wall),
             samples_per_second: round2(summary.samples_per_second),
             threads: if req.include_threads {
-                thread_infos(&cached.profile, &selection.thread_indices)
+                thread_infos(&cached.profile, &selection.thread_indices, Some(&range))
             } else {
                 Vec::new()
             },
@@ -2392,6 +2681,7 @@ impl ProfileServer {
         Parameters(req): Parameters<FocusFunctionRequest>,
     ) -> Result<Json<FocusFunctionResult>, String> {
         let cached = self.get_profile(&req.path)?;
+        let range = AnalysisRange::resolve(&cached.profile, req.start_time_ms, req.end_time_ms)?;
         let selection = select_thread_indices_for_single_or_prefix_scope(
             &cached.profile,
             &req.thread,
@@ -2399,6 +2689,7 @@ impl ProfileServer {
             req.thread_index,
             &req.thread_name_prefix,
             &req.thread_name_prefixes,
+            &range,
         )?;
         let thread_refs: Vec<&ResolvedThread> = selection
             .thread_indices
@@ -2406,8 +2697,10 @@ impl ProfileServer {
             .filter_map(|index| cached.profile.threads.get(*index))
             .collect();
 
+        let stats_by_thread =
+            function_stats_for_threads(&cached, &selection.thread_indices, &range);
         let function_name = resolve_function_name_in_threads(
-            &cached.cache.function_stats,
+            &stats_by_thread,
             req.query.as_deref(),
             req.function_id.as_deref(),
             &req.match_mode,
@@ -2431,6 +2724,8 @@ impl ProfileServer {
         )?;
         let focused = call_tree::build_focused_call_tree_for_threads_with_filter(
             &thread_refs,
+            cached.profile.interval_ms,
+            Some(&range),
             &function_name,
             req.max_depth,
             req.min_percent,
@@ -2445,7 +2740,8 @@ impl ProfileServer {
         let text = focused
             .tree
             .render_text_with_options(req.max_depth, req.short_names, true);
-        let summary = thread_sample_summary(&cached.profile, &selection.thread_indices);
+        let summary =
+            thread_sample_summary(&cached.profile, &selection.thread_indices, Some(&range));
         let (thread, tid, thread_index) = if let Some(selected_thread) = &selection.selected_thread
         {
             (
@@ -2458,13 +2754,14 @@ impl ProfileServer {
         };
 
         Ok(Json(FocusFunctionResult {
+            effective_range: effective_time_range(&range),
             scope: selection.scope,
             thread,
             tid,
             thread_index,
             thread_count: selection.thread_indices.len(),
             threads: if req.include_threads {
-                thread_infos(&cached.profile, &selection.thread_indices)
+                thread_infos(&cached.profile, &selection.thread_indices, Some(&range))
             } else {
                 Vec::new()
             },
@@ -2493,6 +2790,7 @@ impl ProfileServer {
     ) -> Result<Json<FunctionUnderCallerResult>, String> {
         let cached = self.get_profile(&req.path)?;
         let profile = &cached.profile;
+        let range = AnalysisRange::resolve(profile, req.start_time_ms, req.end_time_ms)?;
         let (scope, thread_indices) = select_thread_indices_for_scope(
             profile,
             &req.thread,
@@ -2500,11 +2798,13 @@ impl ProfileServer {
             req.thread_index,
             &req.thread_name_prefix,
             &req.thread_name_prefixes,
+            &range,
         )?;
         let caller_relationship = parse_caller_relationship(&req.caller_mode)?;
+        let stats_by_thread = function_stats_for_threads(&cached, &thread_indices, &range);
 
         let function_name = resolve_function_name_in_threads(
-            &cached.cache.function_stats,
+            &stats_by_thread,
             req.function_name.as_deref(),
             req.function_id.as_deref(),
             &req.match_mode,
@@ -2515,7 +2815,7 @@ impl ProfileServer {
         })?;
 
         let caller_name = resolve_function_name_in_threads(
-            &cached.cache.function_stats,
+            &stats_by_thread,
             req.caller_name.as_deref(),
             req.caller_function_id.as_deref(),
             &req.caller_match_mode,
@@ -2528,6 +2828,7 @@ impl ProfileServer {
         let metrics = compute_function_under_caller_metrics(
             profile,
             &thread_indices,
+            &range,
             &function_name,
             &caller_name,
             caller_relationship,
@@ -2555,6 +2856,8 @@ impl ProfileServer {
         )?;
         let focused = call_tree::build_focused_call_tree_under_caller_with_filter(
             &thread_refs,
+            profile.interval_ms,
+            Some(&range),
             &function_name,
             &caller_name,
             caller_relationship,
@@ -2571,18 +2874,19 @@ impl ProfileServer {
         let tree = focused
             .tree
             .render_text_with_options(req.max_depth, req.short_names, true);
-        let summary = thread_sample_summary(profile, &thread_indices);
+        let summary = thread_sample_summary(profile, &thread_indices, Some(&range));
 
         Ok(Json(FunctionUnderCallerResult {
+            effective_range: effective_time_range(&range),
             scope,
             thread_count: thread_indices.len(),
             threads: if req.include_threads {
-                thread_infos(profile, &thread_indices)
+                thread_infos(profile, &thread_indices, Some(&range))
             } else {
                 Vec::new()
             },
             matched_threads: if req.include_threads {
-                thread_infos(profile, &metrics.matched_thread_indices)
+                thread_infos(profile, &metrics.matched_thread_indices, Some(&range))
             } else {
                 Vec::new()
             },
@@ -2665,24 +2969,14 @@ impl ProfileServer {
         &self,
         Parameters(req): Parameters<ContextSwitchesRequest>,
     ) -> Result<Json<ContextSwitchesResult>, String> {
-        if req.start_time_ms.is_some_and(|value| !value.is_finite())
-            || req.end_time_ms.is_some_and(|value| !value.is_finite())
-        {
-            return Err("start_time_ms and end_time_ms must be finite numbers".to_string());
-        }
-        if let (Some(start), Some(end)) = (req.start_time_ms, req.end_time_ms)
-            && end <= start
-        {
-            return Err("end_time_ms must be greater than start_time_ms".to_string());
-        }
-
         let cached = self.get_profile(&req.path)?;
+        let range = AnalysisRange::resolve(&cached.profile, req.start_time_ms, req.end_time_ms)?;
         let selected = select_thread(&cached.profile, &req.thread, &req.tid, req.thread_index)?;
         let thread = selected.thread;
         let analysis = context_switch::analyze_context_switches(
             thread,
-            req.start_time_ms,
-            req.end_time_ms,
+            Some(range.raw_start_time_ms()),
+            Some(range.raw_end_time_ms()),
             req.limit.min(200),
         )
         .ok_or_else(|| {
@@ -2716,8 +3010,8 @@ impl ProfileServer {
             .longest_off_cpu_intervals
             .into_iter()
             .map(|interval| OffCpuIntervalInfo {
-                start_time_ms: round2(interval.start_time_ms),
-                end_time_ms: round2(interval.end_time_ms),
+                start_time_ms: round2(range.relative_time_ms(interval.start_time_ms)),
+                end_time_ms: round2(range.relative_time_ms(interval.end_time_ms)),
                 duration_ms: round2(interval.duration_ms),
                 reason: interval.reason,
                 previous_cpu: interval.previous_cpu,
@@ -2726,11 +3020,12 @@ impl ProfileServer {
             .collect();
 
         Ok(Json(ContextSwitchesResult {
+            effective_range: effective_time_range(&range),
             thread: thread.name.clone(),
             tid: thread.tid.clone(),
             thread_index: selected.index,
-            observed_start_time_ms: round2(analysis.observed_start_time_ms),
-            observed_end_time_ms: round2(analysis.observed_end_time_ms),
+            observed_start_time_ms: round2(range.relative_time_ms(analysis.observed_start_time_ms)),
+            observed_end_time_ms: round2(range.relative_time_ms(analysis.observed_end_time_ms)),
             observed_duration_ms: round2(observed_duration_ms),
             on_cpu_time_ms: round2(analysis.on_cpu_time_ms),
             off_cpu_time_ms: round2(analysis.off_cpu_time_ms),
@@ -2752,13 +3047,21 @@ impl ProfileServer {
         Parameters(req): Parameters<FlamegraphRequest>,
     ) -> Result<Json<FlamegraphResult>, String> {
         let cached = self.get_profile(&req.path)?;
-        let selected = select_thread(&cached.profile, &req.thread, &req.tid, req.thread_index)?;
+        let range = AnalysisRange::resolve(&cached.profile, req.start_time_ms, req.end_time_ms)?;
+        let selected = select_sample_thread(
+            &cached.profile,
+            &req.thread,
+            &req.tid,
+            req.thread_index,
+            &range,
+        )?;
         let thread = selected.thread;
+        let stats_by_thread = function_stats_for_threads(&cached, &[selected.index], &range);
 
         let focus_function = if let Some(query) = &req.focus_function {
             Some(
                 resolve_function_name(
-                    &cached.cache.function_stats,
+                    &stats_by_thread,
                     Some(query),
                     req.focus_function_id.as_deref(),
                     &req.match_mode,
@@ -2775,7 +3078,7 @@ impl ProfileServer {
         } else if let Some(function_id) = &req.focus_function_id {
             Some(
                 resolve_function_name(
-                    &cached.cache.function_stats,
+                    &stats_by_thread,
                     None,
                     Some(function_id),
                     &req.match_mode,
@@ -2797,6 +3100,7 @@ impl ProfileServer {
             exclude_framework_enabled(req.exclude_framework, req.user_code_only);
         let stacks = flamegraph::collapsed_stacks_with_options(
             thread,
+            Some(&range),
             focus_function.as_deref(),
             |name| !exclude_framework || !symbols::is_framework_function(name, None),
             req.short_names,
@@ -2809,6 +3113,7 @@ impl ProfileServer {
             .map(|function_name| symbols::compact_function_name(function_name));
 
         Ok(Json(FlamegraphResult {
+            effective_range: effective_time_range(&range),
             thread: thread.name.clone(),
             tid: thread.tid.clone(),
             thread_index: selected.index,
@@ -2844,7 +3149,9 @@ impl ServerHandler for ProfileServer {
                  and profile_flamegraph for collapsed stack output. Prefer \
                  exclude_framework=true or user_code_only=true for Rust/Criterion profiles. \
                  Result rows include display_name for compact Rust symbols and source when \
-                 file/line data is present. Focused trees show both focus and thread percentages."
+                 file/line data is present. Sample-based tools accept inclusive `start_time_ms` \
+                 and `end_time_ms` bounds relative to profile start and return `effective_range`. \
+                 Focused trees show both focus and thread percentages."
                     .to_string(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -2872,7 +3179,7 @@ pub async fn run_server() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::resolved::ResolvedSample;
+    use crate::profile::resolved::{ResolvedSample, SampleWeightType};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2891,6 +3198,7 @@ mod tests {
             pid: "1".to_string(),
             tid: tid.to_string(),
             is_main,
+            sample_weight_type: SampleWeightType::Samples,
             samples: (0..sample_count).map(|_| sample()).collect(),
             markers: vec![],
             duration_ms: sample_count as f64,
@@ -2907,6 +3215,7 @@ mod tests {
             product: "test".to_string(),
             interval_ms: 1.0,
             categories: vec![],
+            observed_start_time_ms: 0.0,
             duration_ms: 100.0,
             total_sample_count: 155,
         }
@@ -2972,7 +3281,7 @@ mod tests {
                 "frameTable": { "length": 1, "func": [0], "category": [0] },
                 "funcTable": { "length": 1, "name": [0] },
                 "stackTable": { "length": 1, "prefix": [null], "frame": [0] },
-                "samples": { "length": 1, "stack": [0], "time": [0], "weight": [1] },
+                "samples": { "length": 2, "stack": [0, 0], "time": [0, 20], "weight": [1, 1] },
                 "markers": {
                     "length": 3,
                     "name": [1, 1, 1],
@@ -2990,6 +3299,48 @@ mod tests {
                 "nativeSymbols": { "length": 0 },
                 "stringArray": [
                     "root_function", "Running on CPU", "CPU 0", "blocked", "CPU 1", "preempted"
+                ]
+            }]
+        }"#
+        .to_string()
+    }
+
+    fn ranged_profile_json() -> String {
+        r#"{
+            "meta": {
+                "categories": [{ "name": "Other", "color": "grey", "subcategories": [] }],
+                "interval": 2,
+                "product": "range-test"
+            },
+            "libs": [],
+            "threads": [{
+                "name": "main-worker",
+                "isMainThread": true,
+                "pid": 1,
+                "tid": 2,
+                "unregisterTime": null,
+                "frameTable": {
+                    "length": 6,
+                    "func": [0, 1, 2, 3, 4, 5],
+                    "category": [0, 0, 0, 0, 0, 0]
+                },
+                "funcTable": { "length": 6, "name": [0, 1, 2, 3, 4, 5] },
+                "stackTable": {
+                    "length": 6,
+                    "prefix": [null, null, 1, 2, 3, 3],
+                    "frame": [0, 1, 2, 3, 4, 5]
+                },
+                "samples": {
+                    "length": 7,
+                    "stack": [0, 4, 4, 4, 5, 5, 5],
+                    "time": [35198474, 35222714, 35222716, 35243472, 35258584, 35258586, 35274854],
+                    "weight": [1, 1, 1, 1, 1, 1, 1],
+                    "weightType": "samples"
+                },
+                "resourceTable": { "length": 0 },
+                "nativeSymbols": { "length": 0 },
+                "stringArray": [
+                    "idle", "root", "caller", "tick_game", "before_kill", "after_kill"
                 ]
             }]
         }"#
@@ -3045,6 +3396,21 @@ mod tests {
 
         assert_eq!(by_tid.index, 0);
         assert_eq!(by_index.thread.name, "worker");
+    }
+
+    #[test]
+    fn duplicate_thread_names_are_selected_after_range_filtering() {
+        let mut profile = profile();
+        for sample in &mut profile.threads[1].samples {
+            sample.timestamp_ms = 50.0;
+        }
+        let range = AnalysisRange::resolve(&profile, Some(0.0), Some(10.0)).unwrap();
+
+        let selected =
+            select_sample_thread(&profile, &Some("app".to_string()), &None, None, &range).unwrap();
+
+        assert_eq!(selected.index, 0);
+        assert_eq!(samples::sample_count(selected.thread, Some(&range)), 5);
     }
 
     #[test]
@@ -3116,6 +3482,149 @@ mod tests {
         assert_eq!(result.cpus[0].cpu, "CPU 0");
         assert_eq!(result.longest_off_cpu_intervals[0].reason, "blocked");
         assert_eq!(result.longest_off_cpu_intervals[0].duration_ms, 6.0);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sample_analysis_tools_use_disjoint_profile_relative_ranges() {
+        let dir = unique_test_dir("analysis-ranges");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("profile.json");
+        std::fs::write(&path, ranged_profile_json()).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let server = ProfileServer::new();
+
+        let Json(info) = server
+            .profile_info(Parameters(ProfileInfoRequest { path: path.clone() }))
+            .unwrap();
+        assert_eq!(info.observed_start_time_ms, 35_198_474.0);
+
+        let first_top: TopFunctionsRequest = serde_json::from_value(serde_json::json!({
+            "path": path,
+            "thread_index": 0,
+            "start_time_ms": 24240,
+            "end_time_ms": 45000
+        }))
+        .unwrap();
+        let Json(first_top) = server.profile_top_functions(Parameters(first_top)).unwrap();
+        assert_eq!(first_top.effective_range.start_time_ms, 24_240.0);
+        assert!(
+            first_top
+                .functions
+                .iter()
+                .any(|row| row.name == "before_kill")
+        );
+        assert!(
+            !first_top
+                .functions
+                .iter()
+                .any(|row| row.name == "after_kill")
+        );
+
+        let second_top: TopFunctionsRequest = serde_json::from_value(serde_json::json!({
+            "path": path,
+            "thread_index": 0,
+            "start_time_ms": 60110,
+            "end_time_ms": 76380
+        }))
+        .unwrap();
+        let Json(second_top) = server
+            .profile_top_functions(Parameters(second_top))
+            .unwrap();
+        assert!(
+            second_top
+                .functions
+                .iter()
+                .any(|row| row.name == "after_kill")
+        );
+        assert!(
+            !second_top
+                .functions
+                .iter()
+                .any(|row| row.name == "before_kill")
+        );
+
+        let first_focus: FocusFunctionRequest = serde_json::from_value(serde_json::json!({
+            "path": path,
+            "thread_index": 0,
+            "query": "tick_game",
+            "match_mode": "exact",
+            "start_time_ms": 24240,
+            "end_time_ms": 45000
+        }))
+        .unwrap();
+        let Json(first_focus) = server
+            .profile_focus_function(Parameters(first_focus))
+            .unwrap();
+        assert_eq!(first_focus.matched_samples, 3);
+        assert_eq!(first_focus.total_scope_samples, 3);
+        assert_eq!(first_focus.focused_time_ms, 6.0);
+        assert_eq!(first_focus.focused_percent, 100.0);
+        assert!(first_focus.tree.contains("before_kill"));
+        assert!(!first_focus.tree.contains("after_kill"));
+
+        let second_focus: FocusFunctionRequest = serde_json::from_value(serde_json::json!({
+            "path": path,
+            "thread_index": 0,
+            "query": "tick_game",
+            "match_mode": "exact",
+            "start_time_ms": 60110,
+            "end_time_ms": 76380
+        }))
+        .unwrap();
+        let Json(second_focus) = server
+            .profile_focus_function(Parameters(second_focus))
+            .unwrap();
+        assert_eq!(second_focus.matched_samples, 3);
+        assert_eq!(second_focus.total_scope_samples, 3);
+        assert_eq!(second_focus.focused_time_ms, 6.0);
+        assert!(second_focus.tree.contains("after_kill"));
+        assert!(!second_focus.tree.contains("before_kill"));
+
+        let call_tree: CallTreeRequest = serde_json::from_value(serde_json::json!({
+            "path": path,
+            "thread_index": 0,
+            "start_time_ms": 24240,
+            "end_time_ms": 45000,
+            "min_percent": 0
+        }))
+        .unwrap();
+        let Json(call_tree) = server.profile_call_tree(Parameters(call_tree)).unwrap();
+        assert_eq!(call_tree.sample_count, 3);
+        assert!(call_tree.tree.contains("before_kill"));
+        assert!(!call_tree.tree.contains("after_kill"));
+
+        let flamegraph: FlamegraphRequest = serde_json::from_value(serde_json::json!({
+            "path": path,
+            "thread_index": 0,
+            "start_time_ms": 60110,
+            "end_time_ms": 76380
+        }))
+        .unwrap();
+        let Json(flamegraph) = server.profile_flamegraph(Parameters(flamegraph)).unwrap();
+        assert!(flamegraph.collapsed_stacks.contains("after_kill 3"));
+        assert!(!flamegraph.collapsed_stacks.contains("before_kill"));
+
+        let under_caller: FunctionUnderCallerRequest = serde_json::from_value(serde_json::json!({
+            "path": path,
+            "thread_index": 0,
+            "function_name": "tick_game",
+            "function_id": null,
+            "caller_name": "caller",
+            "caller_function_id": null,
+            "match_mode": "exact",
+            "caller_match_mode": "exact",
+            "start_time_ms": 24240,
+            "end_time_ms": 45000
+        }))
+        .unwrap();
+        let Json(under_caller) = server
+            .profile_function_under_caller(Parameters(under_caller))
+            .unwrap();
+        assert_eq!(under_caller.descendant_samples, 3);
+        assert_eq!(under_caller.total_scope_samples, 3);
+        assert_eq!(under_caller.descendant_time_ms, 6.0);
 
         std::fs::remove_dir_all(dir).unwrap();
     }

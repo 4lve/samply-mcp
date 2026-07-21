@@ -1,17 +1,23 @@
 use std::collections::HashMap;
 
+use crate::analysis::samples::{self, AnalysisRange};
 use crate::analysis::symbols;
 use crate::profile::resolved::ResolvedThread;
 
 pub fn collapsed_stacks_with_options(
     thread: &ResolvedThread,
+    range: Option<&AnalysisRange>,
     focus_function: Option<&str>,
     mut include_frame: impl FnMut(&str) -> bool,
     short_names: bool,
 ) -> String {
-    let mut stack_counts: HashMap<String, usize> = HashMap::new();
+    let mut stack_counts: HashMap<String, u64> = HashMap::new();
 
-    for sample in &thread.samples {
+    for sample in thread
+        .samples
+        .iter()
+        .filter(|sample| range.is_none_or(|range| range.contains(sample)))
+    {
         if sample.stack.is_empty() {
             continue;
         }
@@ -50,11 +56,11 @@ pub fn collapsed_stacks_with_options(
             continue;
         }
 
-        *stack_counts.entry(stack_str).or_default() += 1;
+        *stack_counts.entry(stack_str).or_default() += u64::from(samples::sample_weight(sample));
     }
 
     // Sort by count descending for deterministic output
-    let mut stacks: Vec<(String, usize)> = stack_counts.into_iter().collect();
+    let mut stacks: Vec<(String, u64)> = stack_counts.into_iter().collect();
     stacks.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
 
     let mut output = String::new();
@@ -67,7 +73,9 @@ pub fn collapsed_stacks_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::resolved::{ResolvedFrame, ResolvedSample, ResolvedThread};
+    use crate::profile::resolved::{
+        ResolvedFrame, ResolvedSample, ResolvedThread, SampleWeightType,
+    };
 
     fn make_frame(name: &str) -> ResolvedFrame {
         ResolvedFrame {
@@ -86,6 +94,7 @@ mod tests {
             pid: "1".to_string(),
             tid: "1".to_string(),
             is_main: true,
+            sample_weight_type: SampleWeightType::Samples,
             duration_ms: 20.0,
             markers: vec![],
             samples: vec![
@@ -110,7 +119,7 @@ mod tests {
             ],
         };
 
-        let output = collapsed_stacks_with_options(&thread, None, |_| true, false);
+        let output = collapsed_stacks_with_options(&thread, None, None, |_| true, false);
         assert!(output.contains("main;foo;bar 2\n"));
         assert!(output.contains("main;baz 1\n"));
     }
@@ -122,6 +131,7 @@ mod tests {
             pid: "1".to_string(),
             tid: "1".to_string(),
             is_main: true,
+            sample_weight_type: SampleWeightType::Samples,
             duration_ms: 20.0,
             markers: vec![],
             samples: vec![
@@ -146,7 +156,7 @@ mod tests {
             ],
         };
 
-        let output = collapsed_stacks_with_options(&thread, Some("foo"), |_| true, false);
+        let output = collapsed_stacks_with_options(&thread, None, Some("foo"), |_| true, false);
 
         assert!(output.contains("foo;bar 2\n"));
         assert!(!output.contains("main;foo;bar"));

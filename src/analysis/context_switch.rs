@@ -233,7 +233,7 @@ pub fn analyze_context_switches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::resolved::ResolvedMarker;
+    use crate::profile::resolved::{ResolvedMarker, SampleWeightType};
     use serde_json::json;
 
     fn marker(start: f64, end: f64, cpu: &str, reason: &str) -> ResolvedMarker {
@@ -253,6 +253,7 @@ mod tests {
             pid: "1".to_string(),
             tid: "2".to_string(),
             is_main: false,
+            sample_weight_type: SampleWeightType::Samples,
             samples: vec![],
             markers,
             duration_ms: 0.0,

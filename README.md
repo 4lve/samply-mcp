@@ -21,7 +21,7 @@ Every tool accepts a `path` parameter, so one server installation works for any 
 
 | Tool | Description |
 |------|-------------|
-| `profile_info` | Profile metadata: duration, sample count, thread count, sampling interval |
+| `profile_info` | Profile metadata: duration, raw observed sample-clock start, sample count, thread count, sampling interval |
 | `profile_threads` | List all threads with stable `thread_index`/`tid`, names, sample counts, and time ranges |
 | `profile_top_functions` | Top N functions by self-time or total-time, with stable `function_id`, compact `display_name`, and source when available |
 | `profile_thread_group_top_functions` | Top functions aggregated across thread name prefixes such as `rayon-gen-*` or `chunk-worker` |
@@ -35,6 +35,10 @@ Every tool accepts a `path` parameter, so one server installation works for any 
 | `profile_flamegraph` | Collapsed stack format, optionally sliced from a focused function |
 
 All tools require a `path` parameter pointing to a profile `.json` or `.json.gz` file. Profiles are loaded on first use and cached in memory.
+
+Sample-based tools accept optional `start_time_ms` and `end_time_ms` bounds. The bounds are inclusive, measured relative to the first observed sample (`0` is profile start), and are applied before thread selection, totals, percentages, and tree construction. Results include an `effective_range` showing the requested range after it was clamped to the profile. `profile_info.observed_start_time_ms` exposes the first sample's original timestamp so profile-relative results can be aligned with logs that use the host-monotonic clock.
+
+CPU time is sample-equivalent time: `samples` weights multiply the profile's configured interval, while `tracing-ms` weights are already milliseconds. Sparse logical-thread samples therefore do not absorb wall-clock gaps or off-CPU time.
 
 Thread names can repeat in multi-process profiles. Prefer `thread_index` or `tid` from `profile_threads` when calling thread-scoped tools. Function-focused tools accept short substrings, and search/top-function rows return a stable `function_id` so follow-up calls do not need to pass huge monomorphized Rust symbols.
 

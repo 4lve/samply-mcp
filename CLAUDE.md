@@ -27,6 +27,7 @@ src/
     ├── symbols.rs      # Rust symbol IDs, compact display names, framework filters
     ├── functions.rs     # Per-function self-time / total-time aggregation
     ├── call_tree.rs     # Call tree construction + text rendering
+    ├── samples.rs       # Profile-relative ranges and sample-equivalent CPU time
     └── flamegraph.rs    # Brendan Gregg collapsed stack format
 ```
 
@@ -46,6 +47,8 @@ All tools require a `path` parameter pointing to a profile file. Profiles are lo
 - `profile_markers` — timeline markers/events (params: path, thread/tid/thread_index, limit)
 - `profile_context_switches` — on/off-CPU time, CPU migration, blocked/preempted switch-outs, and longest off-CPU intervals from profiles recorded with `--per-cpu-threads --cswitch-markers` (params: path, thread/tid/thread_index, start_time_ms/end_time_ms, limit)
 - `profile_flamegraph` — collapsed stack format text, optionally focused (params: path, thread/tid/thread_index, focus_function)
+
+Sample-based tools also accept optional inclusive `start_time_ms`/`end_time_ms` bounds relative to the first observed profile sample, and return the clamped `effective_range`.
 
 Prefer `thread_index` or `tid` from `profile_threads` when selecting one thread; profile thread names can repeat. Use `profile_thread_group_top_functions` when CPU work is split across thread pools. Prefixes are starts-with matches, with a trailing `*` accepted for convenience. Prefer `function_id` from search/top-function rows for follow-up calls with large Rust symbols. For Rust/Criterion profiles, use `exclude_framework: true` or `user_code_only: true` to prune criterion/std/core/alloc/libc/startup frames.
 

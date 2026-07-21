@@ -6,6 +6,8 @@ pub struct ResolvedProfile {
     pub product: String,
     pub interval_ms: f64,
     pub categories: Vec<String>,
+    /// Earliest observed sample timestamp in the profile's original clock domain.
+    pub observed_start_time_ms: f64,
     pub duration_ms: f64,
     pub total_sample_count: usize,
 }
@@ -16,9 +18,17 @@ pub struct ResolvedThread {
     pub pid: String,
     pub tid: String,
     pub is_main: bool,
+    pub sample_weight_type: SampleWeightType,
     pub samples: Vec<ResolvedSample>,
     pub markers: Vec<ResolvedMarker>,
     pub duration_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleWeightType {
+    Samples,
+    TracingMilliseconds,
+    Bytes,
 }
 
 #[derive(Debug, Clone)]
@@ -81,15 +91,22 @@ impl ResolvedProfile {
             );
             total_sample_count += resolved.samples.len();
 
-            if let (Some(first), Some(last)) = (resolved.samples.first(), resolved.samples.last()) {
-                global_min_time = global_min_time.min(first.timestamp_ms);
-                global_max_time = global_max_time.max(last.timestamp_ms);
+            for sample in &resolved.samples {
+                if sample.timestamp_ms.is_finite() {
+                    global_min_time = global_min_time.min(sample.timestamp_ms);
+                    global_max_time = global_max_time.max(sample.timestamp_ms);
+                }
             }
 
             threads.push(resolved);
         }
 
-        let duration_ms = if global_max_time > global_min_time {
+        let observed_start_time_ms = if global_min_time.is_finite() {
+            global_min_time
+        } else {
+            0.0
+        };
+        let duration_ms = if global_max_time.is_finite() && global_max_time > global_min_time {
             global_max_time - global_min_time
         } else {
             0.0
@@ -100,6 +117,7 @@ impl ResolvedProfile {
             product: raw.meta.product.clone().unwrap_or_default(),
             interval_ms: raw.meta.interval,
             categories,
+            observed_start_time_ms,
             duration_ms,
             total_sample_count,
         }
@@ -327,8 +345,21 @@ fn resolve_thread(
     }
 
     // Thread duration
-    let duration_ms = if let (Some(first), Some(last)) = (samples.first(), samples.last()) {
-        last.timestamp_ms - first.timestamp_ms
+    let (first_time_ms, last_time_ms) = samples.iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(first, last), sample| {
+            if sample.timestamp_ms.is_finite() {
+                (
+                    first.min(sample.timestamp_ms),
+                    last.max(sample.timestamp_ms),
+                )
+            } else {
+                (first, last)
+            }
+        },
+    );
+    let duration_ms = if first_time_ms.is_finite() && last_time_ms > first_time_ms {
+        last_time_ms - first_time_ms
     } else {
         0.0
     };
@@ -349,6 +380,11 @@ fn resolve_thread(
         pid,
         tid,
         is_main: thread.is_main_thread,
+        sample_weight_type: match thread.samples.weight_type.as_deref() {
+            Some("tracing-ms") => SampleWeightType::TracingMilliseconds,
+            Some("bytes") => SampleWeightType::Bytes,
+            _ => SampleWeightType::Samples,
+        },
         samples,
         markers,
         duration_ms,

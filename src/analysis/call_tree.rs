@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::analysis::samples::{self, AnalysisRange};
 use crate::analysis::symbols;
 use crate::profile::resolved::{ResolvedFrame, ResolvedThread};
 
@@ -35,33 +36,45 @@ pub fn build_call_tree_with_filter(
     min_percent: f64,
     include_frame: impl FnMut(&str) -> bool,
 ) -> CallTreeNode {
-    build_call_tree_for_threads_with_filter(&[thread], max_depth, min_percent, include_frame)
+    build_call_tree_for_threads_with_filter(
+        &[thread],
+        inferred_test_interval_ms(thread),
+        None,
+        max_depth,
+        min_percent,
+        include_frame,
+    )
 }
 
 pub fn build_call_tree_for_threads_with_filter(
     threads: &[&ResolvedThread],
+    interval_ms: f64,
+    range: Option<&AnalysisRange>,
     max_depth: usize,
     min_percent: f64,
     mut include_frame: impl FnMut(&str) -> bool,
 ) -> CallTreeNode {
     let total_time: f64 = threads
         .iter()
-        .map(|thread| sample_interval_ms(thread) * thread.samples.len() as f64)
+        .map(|thread| samples::thread_sample_time_ms(thread, interval_ms, range))
         .sum();
 
     let mut root = TreeBuilder::new("(root)".to_string());
 
     for thread in threads {
-        let interval_ms = sample_interval_ms(thread);
-
-        for sample in &thread.samples {
+        for sample in thread
+            .samples
+            .iter()
+            .filter(|sample| range.is_none_or(|range| range.contains(sample)))
+        {
+            let sample_time_ms = samples::sample_time_ms(thread, sample, interval_ms);
             if sample.stack.is_empty() {
-                root.self_time += interval_ms;
-                root.total_time += interval_ms;
+                root.self_time += sample_time_ms;
+                root.total_time += sample_time_ms;
                 continue;
             }
 
-            root.total_time += interval_ms;
+            root.total_time += sample_time_ms;
             let mut node = &mut root;
             let mut assigned_self_time = false;
 
@@ -73,7 +86,7 @@ pub fn build_call_tree_for_threads_with_filter(
             {
                 if included_depth >= max_depth {
                     // Attribute remaining time as self-time of the deepest node
-                    node.self_time += interval_ms;
+                    node.self_time += sample_time_ms;
                     assigned_self_time = true;
                     break;
                 }
@@ -82,13 +95,13 @@ pub fn build_call_tree_for_threads_with_filter(
                     .children
                     .entry(frame.function_name.clone())
                     .or_insert_with(|| TreeBuilder::new(frame.function_name.clone()));
-                node.total_time += interval_ms;
+                node.total_time += sample_time_ms;
 
                 // Leaf self-time is assigned after filtering below.
             }
 
             if !assigned_self_time {
-                node.self_time += interval_ms;
+                node.self_time += sample_time_ms;
             }
         }
     }
@@ -106,6 +119,8 @@ pub fn build_focused_call_tree_with_filter(
 ) -> Option<FocusedCallTree> {
     build_focused_call_tree_for_threads_with_filter(
         &[thread],
+        inferred_test_interval_ms(thread),
+        None,
         function_name,
         max_depth,
         min_percent,
@@ -115,6 +130,8 @@ pub fn build_focused_call_tree_with_filter(
 
 pub fn build_focused_call_tree_for_threads_with_filter(
     threads: &[&ResolvedThread],
+    interval_ms: f64,
+    range: Option<&AnalysisRange>,
     function_name: &str,
     max_depth: usize,
     min_percent: f64,
@@ -122,17 +139,22 @@ pub fn build_focused_call_tree_for_threads_with_filter(
 ) -> Option<FocusedCallTree> {
     let total_thread_time: f64 = threads
         .iter()
-        .map(|thread| sample_interval_ms(thread) * thread.samples.len() as f64)
+        .map(|thread| samples::thread_sample_time_ms(thread, interval_ms, range))
         .sum();
-    let total_samples = threads.iter().map(|thread| thread.samples.len()).sum();
+    let total_samples = threads
+        .iter()
+        .map(|thread| samples::sample_count(thread, range))
+        .sum();
 
     let mut root = TreeBuilder::new(function_name.to_string());
     let mut matched_samples = 0usize;
 
     for thread in threads {
-        let interval_ms = sample_interval_ms(thread);
-
-        for sample in &thread.samples {
+        for sample in thread
+            .samples
+            .iter()
+            .filter(|sample| range.is_none_or(|range| range.contains(sample)))
+        {
             let Some(focus_index) = sample
                 .stack
                 .iter()
@@ -142,10 +164,11 @@ pub fn build_focused_call_tree_for_threads_with_filter(
             };
 
             matched_samples += 1;
-            root.total_time += interval_ms;
+            let sample_time_ms = samples::sample_time_ms(thread, sample, interval_ms);
+            root.total_time += sample_time_ms;
 
             if max_depth == 0 {
-                root.self_time += interval_ms;
+                root.self_time += sample_time_ms;
                 continue;
             }
 
@@ -157,7 +180,7 @@ pub fn build_focused_call_tree_for_threads_with_filter(
                     .filter(|frame| include_frame(&frame.function_name)),
             ) {
                 if included_depth >= max_depth {
-                    node.self_time += interval_ms;
+                    node.self_time += sample_time_ms;
                     assigned_self_time = true;
                     break;
                 }
@@ -166,11 +189,11 @@ pub fn build_focused_call_tree_for_threads_with_filter(
                     .children
                     .entry(frame.function_name.clone())
                     .or_insert_with(|| TreeBuilder::new(frame.function_name.clone()));
-                node.total_time += interval_ms;
+                node.total_time += sample_time_ms;
             }
 
             if !assigned_self_time {
-                node.self_time += interval_ms;
+                node.self_time += sample_time_ms;
             }
         }
     }
@@ -195,8 +218,11 @@ pub fn build_focused_call_tree_for_threads_with_filter(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_focused_call_tree_under_caller_with_filter(
     threads: &[&ResolvedThread],
+    interval_ms: f64,
+    range: Option<&AnalysisRange>,
     function_name: &str,
     caller_name: &str,
     caller_relationship: CallerRelationship,
@@ -206,17 +232,22 @@ pub fn build_focused_call_tree_under_caller_with_filter(
 ) -> Option<FocusedCallTree> {
     let total_thread_time: f64 = threads
         .iter()
-        .map(|thread| sample_interval_ms(thread) * thread.samples.len() as f64)
+        .map(|thread| samples::thread_sample_time_ms(thread, interval_ms, range))
         .sum();
-    let total_samples = threads.iter().map(|thread| thread.samples.len()).sum();
+    let total_samples = threads
+        .iter()
+        .map(|thread| samples::sample_count(thread, range))
+        .sum();
 
     let mut root = TreeBuilder::new(function_name.to_string());
     let mut matched_samples = 0usize;
 
     for thread in threads {
-        let interval_ms = sample_interval_ms(thread);
-
-        for sample in &thread.samples {
+        for sample in thread
+            .samples
+            .iter()
+            .filter(|sample| range.is_none_or(|range| range.contains(sample)))
+        {
             let Some(focus_index) = function_under_caller_index(
                 &sample.stack,
                 function_name,
@@ -227,10 +258,11 @@ pub fn build_focused_call_tree_under_caller_with_filter(
             };
 
             matched_samples += 1;
-            root.total_time += interval_ms;
+            let sample_time_ms = samples::sample_time_ms(thread, sample, interval_ms);
+            root.total_time += sample_time_ms;
 
             if max_depth == 0 {
-                root.self_time += interval_ms;
+                root.self_time += sample_time_ms;
                 continue;
             }
 
@@ -242,7 +274,7 @@ pub fn build_focused_call_tree_under_caller_with_filter(
                     .filter(|frame| include_frame(&frame.function_name)),
             ) {
                 if included_depth >= max_depth {
-                    node.self_time += interval_ms;
+                    node.self_time += sample_time_ms;
                     assigned_self_time = true;
                     break;
                 }
@@ -251,11 +283,11 @@ pub fn build_focused_call_tree_under_caller_with_filter(
                     .children
                     .entry(frame.function_name.clone())
                     .or_insert_with(|| TreeBuilder::new(frame.function_name.clone()));
-                node.total_time += interval_ms;
+                node.total_time += sample_time_ms;
             }
 
             if !assigned_self_time {
-                node.self_time += interval_ms;
+                node.self_time += sample_time_ms;
             }
         }
     }
@@ -316,9 +348,15 @@ pub fn function_under_caller_index(
     first_match
 }
 
-pub fn sample_interval_ms(thread: &ResolvedThread) -> f64 {
+#[cfg(test)]
+fn inferred_test_interval_ms(thread: &ResolvedThread) -> f64 {
     if thread.samples.len() >= 2 {
-        thread.duration_ms / (thread.samples.len() - 1) as f64
+        thread
+            .samples
+            .windows(2)
+            .map(|samples| samples[1].timestamp_ms - samples[0].timestamp_ms)
+            .find(|delta| *delta > 0.0 && delta.is_finite())
+            .unwrap_or(1.0)
     } else {
         1.0
     }
@@ -442,7 +480,7 @@ impl CallTreeNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::resolved::{ResolvedFrame, ResolvedSample};
+    use crate::profile::resolved::{ResolvedFrame, ResolvedSample, SampleWeightType};
 
     fn make_frame(name: &str) -> ResolvedFrame {
         ResolvedFrame {
@@ -461,6 +499,7 @@ mod tests {
             pid: "1".to_string(),
             tid: "1".to_string(),
             is_main: true,
+            sample_weight_type: SampleWeightType::Samples,
             duration_ms: 20.0,
             markers: vec![],
             samples: vec![
@@ -500,6 +539,7 @@ mod tests {
             pid: "1".to_string(),
             tid: "1".to_string(),
             is_main: true,
+            sample_weight_type: SampleWeightType::Samples,
             duration_ms: 30.0,
             markers: vec![],
             samples: vec![
@@ -577,6 +617,7 @@ mod tests {
             pid: "1".to_string(),
             tid: "1".to_string(),
             is_main: true,
+            sample_weight_type: SampleWeightType::Samples,
             duration_ms: 30.0,
             markers: vec![],
             samples: vec![
@@ -626,6 +667,8 @@ mod tests {
 
         let focused = build_focused_call_tree_under_caller_with_filter(
             &[&thread],
+            10.0,
+            None,
             "WaterFluid::tick",
             "finish_generation_status",
             CallerRelationship::Ancestor,

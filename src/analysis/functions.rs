@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::analysis::samples::{self, AnalysisRange};
 use crate::profile::resolved::ResolvedThread;
 
 #[derive(Debug, Clone)]
@@ -15,30 +16,32 @@ pub struct FunctionStats {
     pub line: Option<u32>,
 }
 
-pub fn compute_function_stats(thread: &ResolvedThread) -> Vec<FunctionStats> {
-    let interval_ms = if thread.samples.len() >= 2 {
-        let total_time = thread.duration_ms;
-        total_time / (thread.samples.len() - 1) as f64
-    } else {
-        1.0
-    };
-
-    let total_profile_time = interval_ms * thread.samples.len() as f64;
+pub fn compute_function_stats(
+    thread: &ResolvedThread,
+    interval_ms: f64,
+    range: Option<&AnalysisRange>,
+) -> Vec<FunctionStats> {
+    let total_profile_time = samples::thread_sample_time_ms(thread, interval_ms, range);
 
     // Accumulate per-function data
     let mut stats_map: HashMap<String, FunctionStatsAccum> = HashMap::new();
 
-    for sample in &thread.samples {
+    for sample in thread
+        .samples
+        .iter()
+        .filter(|sample| range.is_none_or(|range| range.contains(sample)))
+    {
         if sample.stack.is_empty() {
             continue;
         }
+        let sample_time_ms = samples::sample_time_ms(thread, sample, interval_ms);
 
         // Self-time goes to the leaf frame (last in root-first order)
         let leaf = &sample.stack[sample.stack.len() - 1];
         let entry = stats_map
             .entry(leaf.function_name.clone())
             .or_insert_with(|| FunctionStatsAccum::new(leaf));
-        entry.self_time_ms += interval_ms;
+        entry.self_time_ms += sample_time_ms;
         entry.sample_count += 1;
 
         // Total-time goes to all unique frames in the stack
@@ -48,7 +51,7 @@ pub fn compute_function_stats(thread: &ResolvedThread) -> Vec<FunctionStats> {
                 let entry = stats_map
                     .entry(frame.function_name.clone())
                     .or_insert_with(|| FunctionStatsAccum::new(frame));
-                entry.total_time_ms += interval_ms;
+                entry.total_time_ms += sample_time_ms;
             }
         }
     }
@@ -105,7 +108,7 @@ impl FunctionStatsAccum {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::resolved::{ResolvedFrame, ResolvedSample};
+    use crate::profile::resolved::{ResolvedFrame, ResolvedSample, SampleWeightType};
 
     fn make_frame(name: &str) -> ResolvedFrame {
         ResolvedFrame {
@@ -124,6 +127,7 @@ mod tests {
             pid: "1".to_string(),
             tid: "1".to_string(),
             is_main: true,
+            sample_weight_type: SampleWeightType::Samples,
             duration_ms: 30.0,
             markers: vec![],
             samples: vec![
@@ -154,7 +158,7 @@ mod tests {
             ],
         };
 
-        let stats = compute_function_stats(&thread);
+        let stats = compute_function_stats(&thread, 10.0, None);
 
         let bar = stats.iter().find(|s| s.name == "bar").unwrap();
         assert_eq!(bar.sample_count, 2); // bar is leaf in 2 samples
@@ -162,5 +166,39 @@ mod tests {
         let main_fn = stats.iter().find(|s| s.name == "main").unwrap();
         assert_eq!(main_fn.sample_count, 0); // main is never a leaf
         assert!(main_fn.total_time_ms > 0.0); // but it's in all stacks
+    }
+
+    #[test]
+    fn sparse_samples_use_the_recording_interval() {
+        let thread = ResolvedThread {
+            name: "sparse".to_string(),
+            pid: "1".to_string(),
+            tid: "1".to_string(),
+            is_main: true,
+            sample_weight_type: SampleWeightType::Samples,
+            duration_ms: 1_000.0,
+            markers: vec![],
+            samples: vec![
+                ResolvedSample {
+                    timestamp_ms: 0.0,
+                    weight: 1,
+                    cpu_delta_us: None,
+                    stack: vec![make_frame("main"), make_frame("work")],
+                },
+                ResolvedSample {
+                    timestamp_ms: 1_000.0,
+                    weight: 1,
+                    cpu_delta_us: None,
+                    stack: vec![make_frame("main"), make_frame("work")],
+                },
+            ],
+        };
+
+        let stats = compute_function_stats(&thread, 2.0, None);
+        let work = stats.iter().find(|stat| stat.name == "work").unwrap();
+
+        assert_eq!(work.self_time_ms, 4.0);
+        assert_eq!(work.total_time_ms, 4.0);
+        assert_eq!(work.self_percent, 100.0);
     }
 }
