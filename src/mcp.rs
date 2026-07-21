@@ -18,6 +18,7 @@ use crate::analysis::context_switch;
 use crate::analysis::flamegraph;
 use crate::analysis::functions::{self, FunctionStats};
 use crate::analysis::samples::{self, AnalysisRange};
+use crate::analysis::source;
 use crate::analysis::symbols;
 use crate::profile::parse::{find_syms_sidecar, load_profile};
 use crate::profile::resolved::{ResolvedProfile, ResolvedThread};
@@ -1413,6 +1414,18 @@ pub struct FlamegraphRequest {
     pub thread_index: Option<usize>,
 
     #[schemars(
+        description = "Thread name prefix to aggregate. A trailing '*' is accepted, e.g. chunk-worker*."
+    )]
+    #[serde(default)]
+    pub thread_name_prefix: Option<String>,
+
+    #[schemars(
+        description = "Thread name prefixes to aggregate. A trailing '*' is accepted for prefix-style globs."
+    )]
+    #[serde(default)]
+    pub thread_name_prefixes: Vec<String>,
+
+    #[schemars(
         description = "Optional full function name or substring. If set, output stacks are sliced from that function down to leaf frames."
     )]
     #[serde(default)]
@@ -1622,6 +1635,80 @@ pub struct FocusFunctionRequest {
     #[schemars(description = "Include matching thread rows in the result (default: false).")]
     #[serde(default)]
     pub include_threads: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FunctionSourceRequest {
+    #[schemars(description = "Path to the profile JSON file (or .json.gz)")]
+    pub path: String,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window start in profile-relative milliseconds; 0 is the first observed sample."
+    )]
+    #[serde(default)]
+    pub start_time_ms: Option<f64>,
+
+    #[schemars(
+        description = "Optional inclusive analysis-window end in profile-relative milliseconds."
+    )]
+    #[serde(default)]
+    pub end_time_ms: Option<f64>,
+
+    #[schemars(
+        description = "Full function name or substring whose exclusive samples should be analyzed"
+    )]
+    #[serde(default)]
+    pub query: Option<String>,
+
+    #[schemars(
+        description = "Stable function id returned by profile_search_functions or profile_top_functions"
+    )]
+    #[serde(default)]
+    pub function_id: Option<String>,
+
+    #[schemars(description = "Match mode: 'contains' (default) or 'exact'")]
+    #[serde(default = "default_match_mode")]
+    pub match_mode: String,
+
+    #[schemars(
+        description = "Thread name. If multiple threads have this name, the one with the most samples is used."
+    )]
+    #[serde(default)]
+    pub thread: Option<String>,
+
+    #[schemars(description = "Thread id. Prefer this when profile_threads shows duplicate names.")]
+    #[serde(default)]
+    pub tid: Option<String>,
+
+    #[schemars(description = "Zero-based thread index from profile_threads.")]
+    #[serde(default)]
+    pub thread_index: Option<usize>,
+
+    #[schemars(
+        description = "Thread name prefix to aggregate before grouping exclusive samples. A trailing '*' is accepted."
+    )]
+    #[serde(default)]
+    pub thread_name_prefix: Option<String>,
+
+    #[schemars(
+        description = "Thread name prefixes to aggregate before grouping exclusive samples."
+    )]
+    #[serde(default)]
+    pub thread_name_prefixes: Vec<String>,
+
+    #[schemars(
+        description = "Maximum instruction rows and source-line rows to return (default: 50, maximum: 500)."
+    )]
+    #[serde(default = "default_source_limit")]
+    pub limit: usize,
+
+    #[schemars(description = "Include matching thread rows in the result (default: true).")]
+    #[serde(default = "default_include_threads")]
+    pub include_threads: bool,
+}
+
+fn default_source_limit() -> usize {
+    50
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2014,13 +2101,93 @@ pub struct ContextSwitchesResult {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FlamegraphResult {
     pub effective_range: EffectiveTimeRange,
-    pub thread: String,
-    pub tid: String,
-    pub thread_index: usize,
+    pub scope: String,
+    pub thread: Option<String>,
+    pub tid: Option<String>,
+    pub thread_index: Option<usize>,
+    pub thread_count: usize,
+    pub threads: Vec<ThreadInfo>,
     pub focus_function: Option<String>,
     pub focus_function_id: Option<String>,
     pub focus_display_name: Option<String>,
     pub collapsed_stacks: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct InlineSourceFrameInfo {
+    pub inline_depth: usize,
+    pub function_id: String,
+    pub function_name: String,
+    pub display_name: String,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct InstructionSourceRow {
+    /// Library-relative instruction address, formatted as hexadecimal.
+    pub instruction_address: Option<String>,
+    pub library: Option<String>,
+    pub library_debug_id: Option<String>,
+    pub symbol_name: Option<String>,
+    pub symbol_start_address: Option<String>,
+    pub symbol_offset: Option<String>,
+    pub symbol_size: Option<u64>,
+    pub focus_file: Option<String>,
+    pub focus_line: Option<u32>,
+    pub focus_source: Option<String>,
+    /// `sidecar`, `profile`, or `unresolved`.
+    pub source_origin: String,
+    /// Frames are ordered from the outer function to the deepest inline frame.
+    pub inline_frames: Vec<InlineSourceFrameInfo>,
+    pub sample_count: usize,
+    pub cpu_sample_time_ms: f64,
+    pub percent_of_exclusive: f64,
+    pub percent_of_scope: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FunctionSourceLineRow {
+    pub library: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub source: Option<String>,
+    pub instruction_count: usize,
+    pub instruction_addresses: Vec<String>,
+    pub sample_count: usize,
+    pub cpu_sample_time_ms: f64,
+    pub percent_of_exclusive: f64,
+    pub percent_of_scope: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FunctionSourceResult {
+    pub effective_range: EffectiveTimeRange,
+    pub scope: String,
+    pub thread: Option<String>,
+    pub tid: Option<String>,
+    pub thread_index: Option<usize>,
+    pub thread_count: usize,
+    pub threads: Vec<ThreadInfo>,
+    pub function_id: String,
+    pub function_name: String,
+    pub display_name: String,
+    pub symbol_sidecar_loaded: bool,
+    pub exclusive_samples: usize,
+    pub exclusive_time_ms: f64,
+    pub exclusive_percent_of_scope: f64,
+    pub total_scope_samples: usize,
+    pub scope_time_ms: f64,
+    pub instruction_resolved_samples: usize,
+    pub source_resolved_samples: usize,
+    pub sidecar_symbolicated_samples: usize,
+    pub instruction_count: usize,
+    pub returned_instruction_count: usize,
+    pub source_line_count: usize,
+    pub returned_source_line_count: usize,
+    pub instructions: Vec<InstructionSourceRow>,
+    pub source_lines: Vec<FunctionSourceLineRow>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2782,6 +2949,179 @@ impl ProfileServer {
     }
 
     #[tool(
+        description = "Break down a function's exclusive/self samples by library-relative instruction address and focused source line. Resolves companion .syms.json data and returns outer-to-inner inline frames. Supports profile-relative time ranges and thread-name-prefix aggregation."
+    )]
+    fn profile_function_source(
+        &self,
+        Parameters(req): Parameters<FunctionSourceRequest>,
+    ) -> Result<Json<FunctionSourceResult>, String> {
+        let cached = self.get_profile(&req.path)?;
+        let range = AnalysisRange::resolve(&cached.profile, req.start_time_ms, req.end_time_ms)?;
+        let selection = select_thread_indices_for_single_or_prefix_scope(
+            &cached.profile,
+            &req.thread,
+            &req.tid,
+            req.thread_index,
+            &req.thread_name_prefix,
+            &req.thread_name_prefixes,
+            &range,
+        )?;
+        let stats_by_thread =
+            function_stats_for_threads(&cached, &selection.thread_indices, &range);
+        let function_name = resolve_function_name_in_threads(
+            &stats_by_thread,
+            req.query.as_deref(),
+            req.function_id.as_deref(),
+            &req.match_mode,
+            Some(&selection.thread_indices),
+        )
+        .ok_or_else(|| {
+            format!(
+                "Function not found in scope {}. Provide function_id or query; try profile_search_functions first.",
+                selection.scope
+            )
+        })?;
+
+        let mut breakdown = source::exclusive_source_breakdown(
+            &cached.profile,
+            &selection.thread_indices,
+            &range,
+            &function_name,
+        );
+        if breakdown.exclusive_sample_count == 0 {
+            return Err(format!(
+                "Function '{}' has no exclusive/self samples in scope {} and the selected time range",
+                function_name, selection.scope
+            ));
+        }
+
+        let instruction_count = breakdown.instructions.len();
+        let source_line_count = breakdown.source_lines.len();
+        let limit = req.limit.min(500);
+        breakdown.instructions.truncate(limit);
+        breakdown.source_lines.truncate(limit);
+
+        let instructions: Vec<InstructionSourceRow> = breakdown
+            .instructions
+            .into_iter()
+            .map(|instruction| {
+                let symbol_offset = instruction
+                    .address
+                    .zip(instruction.symbol_start_address)
+                    .and_then(|(address, start)| address.checked_sub(start))
+                    .map(hex_address);
+                let inline_frames = instruction
+                    .inline_frames
+                    .into_iter()
+                    .enumerate()
+                    .map(|(inline_depth, frame)| InlineSourceFrameInfo {
+                        inline_depth,
+                        function_id: symbols::function_id(&frame.function_name),
+                        display_name: symbols::compact_function_name(&frame.function_name),
+                        source: source_location(&frame.file, frame.line),
+                        function_name: frame.function_name,
+                        file: frame.file,
+                        line: frame.line,
+                    })
+                    .collect();
+
+                InstructionSourceRow {
+                    instruction_address: instruction.address.map(hex_address),
+                    library: instruction.library,
+                    library_debug_id: instruction.library_debug_id,
+                    symbol_name: instruction.symbol_name,
+                    symbol_start_address: instruction.symbol_start_address.map(hex_address),
+                    symbol_offset,
+                    symbol_size: instruction.symbol_size,
+                    focus_source: source_location(&instruction.focus_file, instruction.focus_line),
+                    focus_file: instruction.focus_file,
+                    focus_line: instruction.focus_line,
+                    source_origin: instruction.source_origin.to_string(),
+                    inline_frames,
+                    sample_count: instruction.sample_count,
+                    cpu_sample_time_ms: round2(instruction.cpu_sample_time_ms),
+                    percent_of_exclusive: round2(percent(
+                        instruction.cpu_sample_time_ms,
+                        breakdown.exclusive_time_ms,
+                    )),
+                    percent_of_scope: round2(percent(
+                        instruction.cpu_sample_time_ms,
+                        breakdown.scope_time_ms,
+                    )),
+                }
+            })
+            .collect();
+        let source_lines: Vec<FunctionSourceLineRow> = breakdown
+            .source_lines
+            .into_iter()
+            .map(|line| FunctionSourceLineRow {
+                library: line.library,
+                source: source_location(&line.file, line.line),
+                file: line.file,
+                line: line.line,
+                instruction_count: line.instruction_addresses.len(),
+                instruction_addresses: line
+                    .instruction_addresses
+                    .into_iter()
+                    .map(hex_address)
+                    .collect(),
+                sample_count: line.sample_count,
+                cpu_sample_time_ms: round2(line.cpu_sample_time_ms),
+                percent_of_exclusive: round2(percent(
+                    line.cpu_sample_time_ms,
+                    breakdown.exclusive_time_ms,
+                )),
+                percent_of_scope: round2(percent(line.cpu_sample_time_ms, breakdown.scope_time_ms)),
+            })
+            .collect();
+        let (thread, tid, thread_index) = if let Some(selected_thread) = &selection.selected_thread
+        {
+            (
+                Some(selected_thread.thread.name.clone()),
+                Some(selected_thread.thread.tid.clone()),
+                Some(selected_thread.index),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        Ok(Json(FunctionSourceResult {
+            effective_range: effective_time_range(&range),
+            scope: selection.scope,
+            thread,
+            tid,
+            thread_index,
+            thread_count: selection.thread_indices.len(),
+            threads: if req.include_threads {
+                thread_infos(&cached.profile, &selection.thread_indices, Some(&range))
+            } else {
+                Vec::new()
+            },
+            function_id: symbols::function_id(&function_name),
+            display_name: symbols::compact_function_name(&function_name),
+            function_name,
+            symbol_sidecar_loaded: cached.fingerprint.symbols.is_some(),
+            exclusive_samples: breakdown.exclusive_sample_count,
+            exclusive_time_ms: round2(breakdown.exclusive_time_ms),
+            exclusive_percent_of_scope: round2(percent(
+                breakdown.exclusive_time_ms,
+                breakdown.scope_time_ms,
+            )),
+            total_scope_samples: breakdown.scope_sample_count,
+            scope_time_ms: round2(breakdown.scope_time_ms),
+            instruction_resolved_samples: breakdown.instruction_resolved_samples,
+            source_resolved_samples: breakdown.source_resolved_samples,
+            sidecar_symbolicated_samples: breakdown.sidecar_symbolicated_samples,
+            instruction_count,
+            returned_instruction_count: instructions.len(),
+            source_line_count,
+            returned_source_line_count: source_lines.len(),
+            instructions,
+            source_lines,
+        }))
+    }
+
+    #[tool(
         description = "Measure a function only when it appears under a specific caller/ancestor, including exclusive and descendant time. Can aggregate across thread name prefixes."
     )]
     fn profile_function_under_caller(
@@ -3048,47 +3388,36 @@ impl ProfileServer {
     ) -> Result<Json<FlamegraphResult>, String> {
         let cached = self.get_profile(&req.path)?;
         let range = AnalysisRange::resolve(&cached.profile, req.start_time_ms, req.end_time_ms)?;
-        let selected = select_sample_thread(
+        let selection = select_thread_indices_for_single_or_prefix_scope(
             &cached.profile,
             &req.thread,
             &req.tid,
             req.thread_index,
+            &req.thread_name_prefix,
+            &req.thread_name_prefixes,
             &range,
         )?;
-        let thread = selected.thread;
-        let stats_by_thread = function_stats_for_threads(&cached, &[selected.index], &range);
+        let thread_refs: Vec<&ResolvedThread> = selection
+            .thread_indices
+            .iter()
+            .filter_map(|index| cached.profile.threads.get(*index))
+            .collect();
+        let stats_by_thread =
+            function_stats_for_threads(&cached, &selection.thread_indices, &range);
 
-        let focus_function = if let Some(query) = &req.focus_function {
+        let focus_function = if req.focus_function.is_some() || req.focus_function_id.is_some() {
             Some(
-                resolve_function_name(
+                resolve_function_name_in_threads(
                     &stats_by_thread,
-                    Some(query),
+                    req.focus_function.as_deref(),
                     req.focus_function_id.as_deref(),
                     &req.match_mode,
-                    Some(selected.index),
+                    Some(&selection.thread_indices),
                 )
                 .ok_or_else(|| {
                     format!(
-                        "Function '{}' not found in thread {}. Try profile_search_functions first.",
-                        query,
-                        thread_label(selected.index, thread)
-                    )
-                })?,
-            )
-        } else if let Some(function_id) = &req.focus_function_id {
-            Some(
-                resolve_function_name(
-                    &stats_by_thread,
-                    None,
-                    Some(function_id),
-                    &req.match_mode,
-                    Some(selected.index),
-                )
-                .ok_or_else(|| {
-                    format!(
-                        "Function id '{}' not found in thread {}. Try profile_search_functions first.",
-                        function_id,
-                        thread_label(selected.index, thread)
+                        "Focus function not found in scope {}. Try profile_search_functions first.",
+                        selection.scope
                     )
                 })?,
             )
@@ -3098,8 +3427,8 @@ impl ProfileServer {
 
         let exclude_framework =
             exclude_framework_enabled(req.exclude_framework, req.user_code_only);
-        let stacks = flamegraph::collapsed_stacks_with_options(
-            thread,
+        let stacks = flamegraph::collapsed_stacks_for_threads_with_options(
+            &thread_refs,
             Some(&range),
             focus_function.as_deref(),
             |name| !exclude_framework || !symbols::is_framework_function(name, None),
@@ -3111,12 +3440,25 @@ impl ProfileServer {
         let focus_display_name = focus_function
             .as_ref()
             .map(|function_name| symbols::compact_function_name(function_name));
+        let (thread, tid, thread_index) = if let Some(selected_thread) = &selection.selected_thread
+        {
+            (
+                Some(selected_thread.thread.name.clone()),
+                Some(selected_thread.thread.tid.clone()),
+                Some(selected_thread.index),
+            )
+        } else {
+            (None, None, None)
+        };
 
         Ok(Json(FlamegraphResult {
             effective_range: effective_time_range(&range),
-            thread: thread.name.clone(),
-            tid: thread.tid.clone(),
-            thread_index: selected.index,
+            scope: selection.scope,
+            thread,
+            tid,
+            thread_index,
+            thread_count: selection.thread_indices.len(),
+            threads: thread_infos(&cached.profile, &selection.thread_indices, Some(&range)),
             focus_function,
             focus_function_id,
             focus_display_name,
@@ -3141,12 +3483,15 @@ impl ServerHandler for ProfileServer {
                  profile_thread_group_top_functions to aggregate hotspots across thread name \
                  prefixes such as rayon-gen-* or chunk-worker, \
                  profile_focus_function to reroot stacks at a function with percentages scaled \
-                 to matching samples, profile_function_under_caller for exclusive/descendant \
+                 to matching samples, profile_function_source to break exclusive samples down \
+                 by instruction address and source line with inline frames, \
+                 profile_function_under_caller for exclusive/descendant \
                  time when a function appears under a specific caller/ancestor, \
                  profile_call_tree for full hierarchical call analysis, \
                  profile_function_detail for callers/callees, profile_markers for timeline \
                  events, profile_context_switches for on/off-CPU and scheduling analysis, \
-                 and profile_flamegraph for collapsed stack output. Prefer \
+                 and profile_flamegraph for collapsed stack output, including aggregation by \
+                 thread_name_prefix. Prefer \
                  exclude_framework=true or user_code_only=true for Rust/Criterion profiles. \
                  Result rows include display_name for compact Rust symbols and source when \
                  file/line data is present. Sample-based tools accept inclusive `start_time_ms` \
@@ -3158,6 +3503,10 @@ impl ServerHandler for ProfileServer {
             ..Default::default()
         }
     }
+}
+
+fn hex_address(address: u64) -> String {
+    format!("0x{address:x}")
 }
 
 fn round2(v: f64) -> f64 {
@@ -3342,6 +3691,122 @@ mod tests {
                 "stringArray": [
                     "idle", "root", "caller", "tick_game", "before_kill", "after_kill"
                 ]
+            }]
+        }"#
+        .to_string()
+    }
+
+    fn source_profile_json() -> String {
+        r#"{
+            "meta": {
+                "categories": [{ "name": "Other", "color": "grey", "subcategories": [] }],
+                "interval": 2,
+                "product": "source-test"
+            },
+            "libs": [{
+                "name": "source-test",
+                "debugName": "source-test",
+                "breakpadId": "ABCD0"
+            }],
+            "threads": [{
+                "name": "chunk-worker-0",
+                "isMainThread": true,
+                "pid": 1,
+                "tid": 10,
+                "unregisterTime": null,
+                "frameTable": {
+                    "length": 3,
+                    "func": [0, 1, 1],
+                    "category": [0, 0, 0],
+                    "address": [-1, 260, 264]
+                },
+                "funcTable": {
+                    "length": 2,
+                    "name": [0, 1],
+                    "resource": [-1, 0]
+                },
+                "stackTable": {
+                    "length": 3,
+                    "prefix": [null, 0, 0],
+                    "frame": [0, 1, 2]
+                },
+                "samples": {
+                    "length": 3,
+                    "stack": [1, 1, 2],
+                    "time": [1000, 1002, 1010],
+                    "weight": [1, 1, 1],
+                    "weightType": "samples"
+                },
+                "resourceTable": { "length": 1, "lib": [0] },
+                "nativeSymbols": { "length": 0 },
+                "stringArray": ["root", "0x100"]
+            }, {
+                "name": "chunk-worker-1",
+                "isMainThread": false,
+                "pid": 1,
+                "tid": 11,
+                "unregisterTime": null,
+                "frameTable": {
+                    "length": 2,
+                    "func": [0, 1],
+                    "category": [0, 0],
+                    "address": [-1, 264]
+                },
+                "funcTable": {
+                    "length": 2,
+                    "name": [0, 1],
+                    "resource": [-1, 0]
+                },
+                "stackTable": {
+                    "length": 2,
+                    "prefix": [null, 0],
+                    "frame": [0, 1]
+                },
+                "samples": {
+                    "length": 1,
+                    "stack": [1],
+                    "time": [1004],
+                    "weight": [1],
+                    "weightType": "samples"
+                },
+                "resourceTable": { "length": 1, "lib": [0] },
+                "nativeSymbols": { "length": 0 },
+                "stringArray": ["root", "0x104"]
+            }]
+        }"#
+        .to_string()
+    }
+
+    fn source_sidecar_json() -> String {
+        r#"{
+            "string_table": [
+                "ChunkMap::tick_game",
+                "inlined_helper",
+                "src/chunk_map.rs",
+                "src/helper.rs"
+            ],
+            "data": [{
+                "debug_name": "source-test",
+                "debug_id": "AB-CD-00",
+                "code_id": "",
+                "symbol_table": [{
+                    "rva": 256,
+                    "size": 32,
+                    "symbol": 0,
+                    "frames": [
+                        {"function": 1, "file": 3, "line": 20},
+                        {"function": 0, "file": 2, "line": 100}
+                    ]
+                }, {
+                    "rva": 256,
+                    "size": 32,
+                    "symbol": 0,
+                    "frames": [
+                        {"function": 1, "file": 3, "line": 21},
+                        {"function": 0, "file": 2, "line": 101}
+                    ]
+                }],
+                "known_addresses": [[260, 0], [264, 1]]
             }]
         }"#
         .to_string()
@@ -3625,6 +4090,74 @@ mod tests {
         assert_eq!(under_caller.descendant_samples, 3);
         assert_eq!(under_caller.total_scope_samples, 3);
         assert_eq!(under_caller.descendant_time_ms, 6.0);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn source_breakdown_and_flamegraph_aggregate_thread_prefixes_in_range() {
+        let dir = unique_test_dir("function-source");
+        std::fs::create_dir(&dir).unwrap();
+        let profile_path = dir.join("profile.json");
+        let sidecar_path = dir.join("profile.json.syms.json");
+        std::fs::write(&profile_path, source_profile_json()).unwrap();
+        std::fs::write(&sidecar_path, source_sidecar_json()).unwrap();
+        let path = profile_path.to_string_lossy().into_owned();
+        let server = ProfileServer::new();
+
+        let source_request: FunctionSourceRequest = serde_json::from_value(serde_json::json!({
+            "path": path,
+            "query": "ChunkMap::tick_game",
+            "match_mode": "exact",
+            "thread_name_prefix": "chunk-worker-*",
+            "start_time_ms": 0,
+            "end_time_ms": 5,
+            "limit": 10
+        }))
+        .unwrap();
+        let Json(source) = server
+            .profile_function_source(Parameters(source_request))
+            .unwrap();
+
+        assert_eq!(source.effective_range.start_time_ms, 0.0);
+        assert_eq!(source.effective_range.end_time_ms, 5.0);
+        assert_eq!(source.thread_count, 2);
+        assert_eq!(source.exclusive_samples, 3);
+        assert_eq!(source.exclusive_time_ms, 6.0);
+        assert_eq!(source.instruction_count, 2);
+        assert_eq!(source.source_line_count, 2);
+        assert_eq!(source.sidecar_symbolicated_samples, 3);
+        assert_eq!(
+            source.instructions[0].instruction_address.as_deref(),
+            Some("0x104")
+        );
+        assert_eq!(source.instructions[0].sample_count, 2);
+        assert_eq!(source.instructions[0].focus_line, Some(100));
+        assert_eq!(source.instructions[0].inline_frames.len(), 2);
+        assert_eq!(
+            source.instructions[0].inline_frames[1].function_name,
+            "inlined_helper"
+        );
+        assert_eq!(source.source_lines[0].line, Some(100));
+
+        let flamegraph_request: FlamegraphRequest = serde_json::from_value(serde_json::json!({
+            "path": path,
+            "thread_name_prefix": "chunk-worker-*",
+            "start_time_ms": 0,
+            "end_time_ms": 5
+        }))
+        .unwrap();
+        let Json(flamegraph) = server
+            .profile_flamegraph(Parameters(flamegraph_request))
+            .unwrap();
+
+        assert_eq!(flamegraph.thread_count, 2);
+        assert!(flamegraph.thread.is_none());
+        assert!(
+            flamegraph
+                .collapsed_stacks
+                .contains("root;ChunkMap::tick_game 3")
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -4,8 +4,8 @@ use crate::analysis::samples::{self, AnalysisRange};
 use crate::analysis::symbols;
 use crate::profile::resolved::ResolvedThread;
 
-pub fn collapsed_stacks_with_options(
-    thread: &ResolvedThread,
+pub fn collapsed_stacks_for_threads_with_options(
+    threads: &[&ResolvedThread],
     range: Option<&AnalysisRange>,
     focus_function: Option<&str>,
     mut include_frame: impl FnMut(&str) -> bool,
@@ -13,50 +13,53 @@ pub fn collapsed_stacks_with_options(
 ) -> String {
     let mut stack_counts: HashMap<String, u64> = HashMap::new();
 
-    for sample in thread
-        .samples
-        .iter()
-        .filter(|sample| range.is_none_or(|range| range.contains(sample)))
-    {
-        if sample.stack.is_empty() {
-            continue;
-        }
-
-        let frames = if let Some(function_name) = focus_function {
-            let Some(index) = sample
-                .stack
-                .iter()
-                .position(|frame| frame.function_name == function_name)
-            else {
-                continue;
-            };
-            &sample.stack[index..]
-        } else {
-            &sample.stack
-        };
-
-        let stack_str: String = frames
+    for thread in threads {
+        for sample in thread
+            .samples
             .iter()
-            .filter(|frame| {
-                focus_function == Some(frame.function_name.as_str())
-                    || include_frame(&frame.function_name)
-            })
-            .map(|f| f.function_name.as_str())
-            .map(|name| {
-                if short_names {
-                    symbols::compact_function_name(name)
-                } else {
-                    name.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(";");
+            .filter(|sample| range.is_none_or(|range| range.contains(sample)))
+        {
+            if sample.stack.is_empty() {
+                continue;
+            }
 
-        if stack_str.is_empty() {
-            continue;
+            let frames = if let Some(function_name) = focus_function {
+                let Some(index) = sample
+                    .stack
+                    .iter()
+                    .position(|frame| frame.function_name == function_name)
+                else {
+                    continue;
+                };
+                &sample.stack[index..]
+            } else {
+                &sample.stack
+            };
+
+            let stack_str: String = frames
+                .iter()
+                .filter(|frame| {
+                    focus_function == Some(frame.function_name.as_str())
+                        || include_frame(&frame.function_name)
+                })
+                .map(|f| f.function_name.as_str())
+                .map(|name| {
+                    if short_names {
+                        symbols::compact_function_name(name)
+                    } else {
+                        name.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+
+            if stack_str.is_empty() {
+                continue;
+            }
+
+            *stack_counts.entry(stack_str).or_default() +=
+                u64::from(samples::sample_weight(sample));
         }
-
-        *stack_counts.entry(stack_str).or_default() += u64::from(samples::sample_weight(sample));
     }
 
     // Sort by count descending for deterministic output
@@ -84,6 +87,7 @@ mod tests {
             line: None,
             category: "Other".to_string(),
             library: None,
+            instruction: None,
         }
     }
 
@@ -119,7 +123,8 @@ mod tests {
             ],
         };
 
-        let output = collapsed_stacks_with_options(&thread, None, None, |_| true, false);
+        let output =
+            collapsed_stacks_for_threads_with_options(&[&thread], None, None, |_| true, false);
         assert!(output.contains("main;foo;bar 2\n"));
         assert!(output.contains("main;baz 1\n"));
     }
@@ -156,7 +161,13 @@ mod tests {
             ],
         };
 
-        let output = collapsed_stacks_with_options(&thread, None, Some("foo"), |_| true, false);
+        let output = collapsed_stacks_for_threads_with_options(
+            &[&thread],
+            None,
+            Some("foo"),
+            |_| true,
+            false,
+        );
 
         assert!(output.contains("foo;bar 2\n"));
         assert!(!output.contains("main;foo;bar"));

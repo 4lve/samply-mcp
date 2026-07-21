@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use super::symbols::{SymbolAddressInfo, SymbolSidecar};
 use super::types::{RawMarkerSchema, RawProfile, RawThread};
 
 #[derive(Debug, Clone)]
@@ -46,6 +49,16 @@ pub struct ResolvedFrame {
     pub line: Option<u32>,
     pub category: String,
     pub library: Option<String>,
+    pub instruction: Option<ResolvedInstruction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedInstruction {
+    /// Library-relative sampled instruction address.
+    pub address: u64,
+    pub inline_depth: u16,
+    pub library_debug_id: Option<String>,
+    pub symbol: Option<Arc<SymbolAddressInfo>>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +73,10 @@ pub struct ResolvedMarker {
 
 impl ResolvedProfile {
     pub fn from_raw(raw: &RawProfile) -> Self {
+        Self::from_raw_with_symbols(raw, None)
+    }
+
+    pub(crate) fn from_raw_with_symbols(raw: &RawProfile, symbols: Option<&SymbolSidecar>) -> Self {
         let categories: Vec<String> = raw.meta.categories.iter().map(|c| c.name.clone()).collect();
 
         // The string table can be in shared.stringArray (newer format) or per-thread
@@ -88,6 +105,7 @@ impl ResolvedProfile {
                 &categories,
                 &raw.libs,
                 &raw.meta.marker_schema,
+                symbols,
             );
             total_sample_count += resolved.samples.len();
 
@@ -130,6 +148,7 @@ fn resolve_thread(
     categories: &[String],
     libs: &[super::types::RawLib],
     marker_schema: &[RawMarkerSchema],
+    symbols: Option<&SymbolSidecar>,
 ) -> ResolvedThread {
     let str_at = |idx: usize| -> String {
         strings
@@ -194,6 +213,8 @@ fn resolve_thread(
     let mut frame_func_idx: Vec<usize> = Vec::with_capacity(frame_count);
     let mut frame_category: Vec<String> = Vec::with_capacity(frame_count);
     let mut frame_line: Vec<Option<u32>> = Vec::with_capacity(frame_count);
+    let mut frame_address: Vec<Option<u64>> = Vec::with_capacity(frame_count);
+    let mut frame_inline_depth: Vec<u16> = Vec::with_capacity(frame_count);
 
     for i in 0..frame_count {
         frame_func_idx.push(thread.frame_table.func[i]);
@@ -212,6 +233,23 @@ fn resolve_thread(
             .as_ref()
             .and_then(|l| l.get(i).copied().flatten());
         frame_line.push(line);
+
+        frame_address.push(
+            thread
+                .frame_table
+                .address
+                .as_ref()
+                .and_then(|addresses| addresses.get(i))
+                .and_then(nonnegative_u64),
+        );
+        frame_inline_depth.push(
+            thread
+                .frame_table
+                .inline_depth
+                .as_ref()
+                .and_then(|depths| depths.get(i).copied())
+                .unwrap_or(0),
+        );
     }
 
     // Resolve a stack index into a Vec<ResolvedFrame> (leaf first, then reversed to root-first)
@@ -227,6 +265,31 @@ fn resolve_thread(
 
             if frame_idx < frame_count {
                 let fi = frame_func_idx[frame_idx];
+                let library_index =
+                    func_resource
+                        .get(fi)
+                        .copied()
+                        .flatten()
+                        .and_then(|resource_index| {
+                            thread
+                                .resource_table
+                                .lib
+                                .as_ref()
+                                .and_then(|indices| indices.get(resource_index).copied().flatten())
+                        });
+                let library = library_index.and_then(|index| libs.get(index));
+                let instruction = frame_address[frame_idx].map(|address| ResolvedInstruction {
+                    address,
+                    inline_depth: frame_inline_depth[frame_idx],
+                    library_debug_id: library.map(|library| library.breakpad_id.clone()),
+                    symbol: library.and_then(|library| {
+                        symbols.and_then(|symbols| {
+                            symbols
+                                .lookup(&library.breakpad_id, &library.debug_name, address)
+                                .cloned()
+                        })
+                    }),
+                });
                 let frame = ResolvedFrame {
                     function_name: func_names.get(fi).cloned().unwrap_or_default(),
                     file: func_files.get(fi).cloned().flatten(),
@@ -237,6 +300,7 @@ fn resolve_thread(
                         .copied()
                         .flatten()
                         .and_then(&resource_lib_name),
+                    instruction,
                 };
                 frames.push(frame);
             }
@@ -389,6 +453,12 @@ fn resolve_thread(
         markers,
         duration_ms,
     }
+}
+
+fn nonnegative_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
 }
 
 fn resolve_marker_strings(

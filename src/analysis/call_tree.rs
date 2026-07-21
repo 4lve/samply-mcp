@@ -489,6 +489,7 @@ mod tests {
             line: None,
             category: "Other".to_string(),
             library: None,
+            instruction: None,
         }
     }
 

@@ -26,12 +26,13 @@ Every tool accepts a `path` parameter, so one server installation works for any 
 | `profile_thread_group_top_functions` | Top functions aggregated across thread name prefixes such as `rayon-gen-*` or `chunk-worker` |
 | `profile_search_functions` | Find full symbol names and `function_id` values by substring, with per-thread timing |
 | `profile_focus_function` | Reroot stacks at a function and show both focused and thread-level percentages |
+| `profile_function_source` | Break a function's exclusive samples down by instruction address and source line, with inline frames from `.syms.json` |
 | `profile_function_under_caller` | Measure exclusive and descendant time for a function only when it appears under a caller/ancestor |
 | `profile_call_tree` | Hierarchical call tree with optional `exclude_framework`/`user_code_only` pruning |
 | `profile_function_detail` | Callers, callees, and source locations for a specific function |
 | `profile_markers` | Timeline markers and events |
 | `profile_context_switches` | On/off-CPU time, CPU migration, switch-out reasons, and longest scheduling gaps |
-| `profile_flamegraph` | Collapsed stack format, optionally sliced from a focused function |
+| `profile_flamegraph` | Collapsed stack format, optionally focused or aggregated by thread-name prefix |
 
 All tools require a `path` parameter pointing to a profile `.json` or `.json.gz` file. Profiles are loaded on first use and cached in memory.
 
@@ -42,6 +43,8 @@ CPU time is sample-equivalent time: `samples` weights multiply the profile's con
 Thread names can repeat in multi-process profiles. Prefer `thread_index` or `tid` from `profile_threads` when calling thread-scoped tools. Function-focused tools accept short substrings, and search/top-function rows return a stable `function_id` so follow-up calls do not need to pass huge monomorphized Rust symbols.
 
 Use `profile_thread_group_top_functions` when work is spread across thread pools. `thread_name_prefix: "rayon-gen-*"` matches all names starting with `rayon-gen-`, and `thread_name_prefixes: ["rayon-gen-*", "chunk-worker"]` returns one aggregate group per prefix. Use `profile_function_under_caller` for scoped questions like `WaterFluid::tick` only under `finish_generation_status`; `caller_mode: "ancestor"` is the default, and `caller_mode: "immediate"` requires the direct caller.
+
+Use `profile_function_source` when a hotspot has a large self-time bucket. It groups only the function's exclusive leaf samples by library-relative instruction address and by the focused function's source line, reports sample-equivalent CPU time and percentages, and includes the full outer-to-inner inline chain from the companion `.syms.json`. It accepts the same profile-relative time range and `thread_name_prefix`/`thread_name_prefixes` aggregation as the other focused tools. `profile_flamegraph` accepts those prefix selectors as well.
 
 For Rust or Criterion profiles, pass `exclude_framework: true` or `user_code_only: true` to prune common runtime/framework frames such as `criterion`, `std`, `core`, `alloc`, `libc`, raw addresses, and startup frames. Focused call trees report nodes as `X% focus / Y% thread` to avoid mistaking a small focused subset for a large whole-profile cost.
 

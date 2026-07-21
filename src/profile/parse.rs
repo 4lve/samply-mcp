@@ -5,9 +5,15 @@ use std::io::BufReader;
 use std::path::Path;
 
 use super::resolved::ResolvedProfile;
+use super::symbols::SymbolSidecar;
 use super::types::RawProfile;
 
 pub fn load_raw_profile(path: &Path) -> Result<RawProfile> {
+    let (profile, _) = load_raw_profile_and_symbols(path)?;
+    Ok(profile)
+}
+
+fn load_raw_profile_and_symbols(path: &Path) -> Result<(RawProfile, Option<SymbolSidecar>)> {
     let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
 
@@ -23,17 +29,22 @@ pub fn load_raw_profile(path: &Path) -> Result<RawProfile> {
     };
 
     // Auto-apply .syms.json sidecar if present alongside the profile
-    if let Some(syms_path) = find_syms_sidecar(path) {
-        apply_symbols(&mut profile, &syms_path)
-            .with_context(|| format!("Failed to apply symbols from {}", syms_path.display()))?;
+    let symbols = find_syms_sidecar(path)
+        .map(|syms_path| {
+            SymbolSidecar::load(&syms_path)
+                .with_context(|| format!("Failed to apply symbols from {}", syms_path.display()))
+        })
+        .transpose()?;
+    if let Some(symbols) = &symbols {
+        apply_symbols(&mut profile, symbols);
     }
 
-    Ok(profile)
+    Ok((profile, symbols))
 }
 
 pub fn load_profile(path: &Path) -> Result<ResolvedProfile> {
-    let raw = load_raw_profile(path)?;
-    let resolved = ResolvedProfile::from_raw(&raw);
+    let (raw, symbols) = load_raw_profile_and_symbols(path)?;
+    let resolved = ResolvedProfile::from_raw_with_symbols(&raw, symbols.as_ref());
     Ok(resolved)
 }
 
@@ -55,65 +66,25 @@ pub(crate) fn find_syms_sidecar(profile_path: &Path) -> Option<std::path::PathBu
     }
 }
 
-/// Merge symbol names from a samply `.syms.json` sidecar into the profile's string tables.
-fn apply_symbols(profile: &mut RawProfile, syms_path: &Path) -> Result<()> {
-    let syms: serde_json::Value = serde_json::from_reader(BufReader::new(
-        File::open(syms_path).with_context(|| format!("Failed to open {}", syms_path.display()))?,
-    ))?;
-
-    let sym_strings: Vec<&str> = syms["string_table"]
-        .as_array()
-        .context("syms string_table is not an array")?
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
-
-    // Build: normalized_debug_id -> {frame_address -> symbol_name}
-    let mut lib_sym_names: std::collections::HashMap<String, std::collections::HashMap<u64, &str>> =
-        std::collections::HashMap::new();
-
-    if let Some(data) = syms["data"].as_array() {
-        for entry in data {
-            let debug_id = entry["debug_id"].as_str().unwrap_or("");
-            let key = normalize_debug_id(debug_id);
-            let symbol_table = entry["symbol_table"]
-                .as_array()
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-
-            let mut addr_to_name: std::collections::HashMap<u64, &str> =
-                std::collections::HashMap::new();
-
-            if let Some(known) = entry["known_addresses"].as_array() {
-                for pair in known {
-                    let arr = pair.as_array().filter(|a| a.len() == 2);
-                    if let Some(arr) = arr {
-                        let addr = arr[0].as_u64();
-                        let sym_idx = arr[1].as_u64().map(|i| i as usize);
-                        if let (Some(addr), Some(sym_idx)) = (addr, sym_idx)
-                            && let Some(sym) = symbol_table.get(sym_idx)
-                            && let Some(name_idx) = sym["symbol"].as_u64().map(|i| i as usize)
-                            && let Some(name) = sym_strings.get(name_idx)
-                        {
-                            addr_to_name.insert(addr, name);
-                        }
-                    }
-                }
-            }
-
-            lib_sym_names.insert(key, addr_to_name);
-        }
+/// Merge symbol names from a samply `.syms.json` sidecar into per-thread string tables.
+fn apply_symbols(profile: &mut RawProfile, symbols: &SymbolSidecar) {
+    // A presymbolicated profile already has its intended function and inline
+    // frame names. The sidecar is still retained for instruction/source lookup.
+    if profile.meta.symbolicated {
+        return;
     }
 
-    // Build lib index -> normalized breakpad ID
-    let lib_keys: Vec<String> = profile
-        .libs
-        .iter()
-        .map(|lib| normalize_debug_id(&lib.breakpad_id))
-        .collect();
+    let shared_strings = profile
+        .shared
+        .as_ref()
+        .map(|shared| shared.string_array.clone())
+        .unwrap_or_default();
 
     // Apply to each thread's string array
     for thread in &mut profile.threads {
+        if thread.string_array.is_none() && !shared_strings.is_empty() {
+            thread.string_array = Some(shared_strings.clone());
+        }
         let string_array = match &mut thread.string_array {
             Some(sa) => sa,
             None => continue,
@@ -129,6 +100,15 @@ fn apply_symbols(profile: &mut RawProfile, syms_path: &Path) -> Result<()> {
         let mut resolved_strs = std::collections::HashSet::new();
 
         for fi in 0..ft.length {
+            if ft
+                .inline_depth
+                .as_ref()
+                .and_then(|depths| depths.get(fi))
+                .is_some_and(|depth| *depth > 0)
+            {
+                continue;
+            }
+
             let addr_val = frame_addresses.get(fi);
             let addr = match addr_val {
                 Some(serde_json::Value::Number(n)) => match n.as_u64() {
@@ -156,36 +136,25 @@ fn apply_symbols(profile: &mut RawProfile, syms_path: &Path) -> Result<()> {
                 _ => continue,
             };
 
-            let key = match lib_keys.get(lib_idx) {
-                Some(k) => k,
+            let lib = match profile.libs.get(lib_idx) {
+                Some(lib) => lib,
                 None => continue,
             };
 
-            let name_map = match lib_sym_names.get(key) {
-                Some(m) => m,
+            let symbol = match symbols.lookup(&lib.breakpad_id, &lib.debug_name, addr) {
+                Some(symbol) => symbol,
                 None => continue,
             };
 
-            if let Some(&name) = name_map.get(&addr) {
-                let str_idx = match func_t.name.get(func_idx) {
-                    Some(&i) => i,
-                    None => continue,
-                };
-                if resolved_strs.insert(str_idx)
-                    && let Some(slot) = string_array.get_mut(str_idx)
-                {
-                    *slot = name.to_string();
-                }
+            let str_idx = match func_t.name.get(func_idx) {
+                Some(&i) => i,
+                None => continue,
+            };
+            if resolved_strs.insert(str_idx)
+                && let Some(slot) = string_array.get_mut(str_idx)
+            {
+                *slot = symbol.symbol_name.clone();
             }
         }
     }
-
-    Ok(())
-}
-
-fn normalize_debug_id(s: &str) -> String {
-    s.replace('-', "")
-        .to_lowercase()
-        .trim_end_matches('0')
-        .to_string()
 }
