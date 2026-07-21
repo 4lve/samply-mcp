@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+pub mod dwarf;
+#[allow(dead_code)]
 pub mod parse;
 #[allow(dead_code)]
 pub mod resolved;

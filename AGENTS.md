@@ -23,7 +23,8 @@ src/
 │   ├── types.rs         # Serde types for Firefox Profiler JSON
 │   ├── parse.rs         # Gzip decompression + JSON deserialization
 │   ├── resolved.rs      # Denormalized profile with resolved index references
-│   └── symbols.rs       # Samply .syms.json address, source-line, and inline-frame resolver
+│   ├── symbols.rs       # Samply .syms.json address, source-line, and inline-frame fallback
+│   └── dwarf.rs         # Verified recorded-binary per-PC DWARF resolver
 └── analysis/
     ├── symbols.rs      # Rust symbol IDs, compact display names, framework filters
     ├── functions.rs     # Per-function self-time / total-time aggregation
@@ -43,7 +44,7 @@ All tools require a `path` parameter pointing to a profile file. Profiles are lo
 - `profile_thread_group_top_functions` — top functions aggregated across thread name prefixes such as `rayon-gen-*` or `chunk-worker` (params: path, thread_name_prefix or thread_name_prefixes, sort_by, limit, include, exclude, exclude_framework/user_code_only)
 - `profile_search_functions` — find full symbol names and `function_id` values by substring (params: path, query, thread/tid/thread_index, match_mode, sort_by, limit, exclude_framework/user_code_only)
 - `profile_focus_function` — reroot stacks at one function and show both focus/thread percentages (params: path, query or function_id, thread/tid/thread_index, max_depth, min_percent, exclude_framework/user_code_only, short_names)
-- `profile_function_source` — group a function's exclusive samples by instruction address and source line, including `.syms.json` inline frames and optional thread-prefix aggregation (params: path, query or function_id, thread/tid/thread_index or thread_name_prefix, start_time_ms/end_time_ms, limit)
+- `profile_function_source` — group a function's exclusive samples by instruction address and resolve each PC through matching recorded-binary DWARF, with `.syms.json` fallback and optional thread-prefix aggregation (params: path, query or function_id, thread/tid/thread_index or thread_name_prefix, start_time_ms/end_time_ms, limit)
 - `profile_function_under_caller` — exclusive/descendant time for a function only under a specific caller/ancestor, optionally aggregated by thread name prefix (params: path, function_name/function_id, caller_name/caller_function_id, caller_mode, thread/tid/thread_index or thread_name_prefix, max_depth, min_percent, exclude_framework/user_code_only, short_names)
 - `profile_call_tree` — hierarchical call tree with time % and optional framework pruning (params: path, thread/tid/thread_index, max_depth, min_percent, exclude_framework/user_code_only, short_names)
 - `profile_function_detail` — callers/callees/source for one function, substring, or `function_id` (params: path, function_name or function_id, match_mode)

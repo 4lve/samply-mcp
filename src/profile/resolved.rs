@@ -6,6 +6,7 @@ use super::types::{RawMarkerSchema, RawProfile, RawThread};
 #[derive(Debug, Clone)]
 pub struct ResolvedProfile {
     pub threads: Vec<ResolvedThread>,
+    pub libraries: Vec<ResolvedLibrary>,
     pub product: String,
     pub interval_ms: f64,
     pub categories: Vec<String>,
@@ -13,6 +14,16 @@ pub struct ResolvedProfile {
     pub observed_start_time_ms: f64,
     pub duration_ms: f64,
     pub total_sample_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedLibrary {
+    pub name: String,
+    pub path: String,
+    pub debug_name: String,
+    pub debug_path: String,
+    pub breakpad_id: String,
+    pub code_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +68,7 @@ pub struct ResolvedInstruction {
     /// Library-relative sampled instruction address.
     pub address: u64,
     pub inline_depth: u16,
+    pub library_index: Option<usize>,
     pub library_debug_id: Option<String>,
     pub symbol: Option<Arc<SymbolAddressInfo>>,
 }
@@ -132,6 +144,18 @@ impl ResolvedProfile {
 
         ResolvedProfile {
             threads,
+            libraries: raw
+                .libs
+                .iter()
+                .map(|library| ResolvedLibrary {
+                    name: library.name.clone(),
+                    path: library.path.clone(),
+                    debug_name: library.debug_name.clone(),
+                    debug_path: library.debug_path.clone(),
+                    breakpad_id: library.breakpad_id.clone(),
+                    code_id: library.code_id.clone(),
+                })
+                .collect(),
             product: raw.meta.product.clone().unwrap_or_default(),
             interval_ms: raw.meta.interval,
             categories,
@@ -281,6 +305,7 @@ fn resolve_thread(
                 let instruction = frame_address[frame_idx].map(|address| ResolvedInstruction {
                     address,
                     inline_depth: frame_inline_depth[frame_idx],
+                    library_index,
                     library_debug_id: library.map(|library| library.breakpad_id.clone()),
                     symbol: library.and_then(|library| {
                         symbols.and_then(|symbols| {

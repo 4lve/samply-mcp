@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+addr2line = "0.25"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
+memmap2 = "0.9"
+object = "0.37"
 regex = "1"
 rmcp = { version = "0.16", features = ["server"] }
 schemars = "1"

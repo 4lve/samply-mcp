@@ -7,7 +7,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-/// Symbol and source information for one sampled instruction address.
+/// Cached symbol/source information referenced by one or more sampled addresses.
+/// Samply may deduplicate many PCs to one record, so this is only a fallback
+/// when live per-PC DWARF resolution is unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolAddressInfo {
     pub symbol_name: String,

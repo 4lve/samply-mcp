@@ -2137,7 +2137,7 @@ pub struct InstructionSourceRow {
     pub focus_file: Option<String>,
     pub focus_line: Option<u32>,
     pub focus_source: Option<String>,
-    /// `sidecar`, `profile`, or `unresolved`.
+    /// `dwarf`, `sidecar`, `profile`, or `unresolved`.
     pub source_origin: String,
     /// Frames are ordered from the outer function to the deepest inline frame.
     pub inline_frames: Vec<InlineSourceFrameInfo>,
@@ -2145,6 +2145,18 @@ pub struct InstructionSourceRow {
     pub cpu_sample_time_ms: f64,
     pub percent_of_exclusive: f64,
     pub percent_of_scope: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DwarfResolutionInfo {
+    pub attempted_library_count: usize,
+    pub loaded_library_count: usize,
+    pub identity_verified_library_count: usize,
+    pub attempted_instruction_count: usize,
+    pub resolved_instruction_count: usize,
+    pub resolved_sample_count: usize,
+    pub binary_paths: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2174,6 +2186,7 @@ pub struct FunctionSourceResult {
     pub function_name: String,
     pub display_name: String,
     pub symbol_sidecar_loaded: bool,
+    pub dwarf_resolution: DwarfResolutionInfo,
     pub exclusive_samples: usize,
     pub exclusive_time_ms: f64,
     pub exclusive_percent_of_scope: f64,
@@ -2949,7 +2962,7 @@ impl ProfileServer {
     }
 
     #[tool(
-        description = "Break down a function's exclusive/self samples by library-relative instruction address and focused source line. Resolves companion .syms.json data and returns outer-to-inner inline frames. Supports profile-relative time ranges and thread-name-prefix aggregation."
+        description = "Break down a function's exclusive/self samples by library-relative instruction address and focused source line. Resolves every sampled PC from matching recorded-binary DWARF when available, with companion .syms.json and profile data as fallbacks. Returns outer-to-inner inline frames and supports profile-relative time ranges and thread-name-prefix aggregation."
     )]
     fn profile_function_source(
         &self,
@@ -2994,6 +3007,8 @@ impl ProfileServer {
                 function_name, selection.scope
             ));
         }
+
+        let dwarf = source::resolve_dwarf_sources(&cached.profile, &function_name, &mut breakdown);
 
         let instruction_count = breakdown.instructions.len();
         let source_line_count = breakdown.source_lines.len();
@@ -3101,6 +3116,16 @@ impl ProfileServer {
             display_name: symbols::compact_function_name(&function_name),
             function_name,
             symbol_sidecar_loaded: cached.fingerprint.symbols.is_some(),
+            dwarf_resolution: DwarfResolutionInfo {
+                attempted_library_count: dwarf.attempted_library_count,
+                loaded_library_count: dwarf.loaded_library_count,
+                identity_verified_library_count: dwarf.identity_verified_library_count,
+                attempted_instruction_count: dwarf.attempted_instruction_count,
+                resolved_instruction_count: dwarf.resolved_instruction_count,
+                resolved_sample_count: dwarf.resolved_sample_count,
+                binary_paths: dwarf.binary_paths,
+                warnings: dwarf.warnings,
+            },
             exclusive_samples: breakdown.exclusive_sample_count,
             exclusive_time_ms: round2(breakdown.exclusive_time_ms),
             exclusive_percent_of_scope: round2(percent(
@@ -3561,6 +3586,7 @@ mod tests {
                 thread("app", "2", true, 50),
                 thread("worker", "3", false, 100),
             ],
+            libraries: vec![],
             product: "test".to_string(),
             interval_ms: 1.0,
             categories: vec![],
@@ -4127,6 +4153,10 @@ mod tests {
         assert_eq!(source.instruction_count, 2);
         assert_eq!(source.source_line_count, 2);
         assert_eq!(source.sidecar_symbolicated_samples, 3);
+        assert_eq!(source.dwarf_resolution.attempted_library_count, 1);
+        assert_eq!(source.dwarf_resolution.attempted_instruction_count, 2);
+        assert_eq!(source.dwarf_resolution.loaded_library_count, 0);
+        assert!(!source.dwarf_resolution.warnings.is_empty());
         assert_eq!(
             source.instructions[0].instruction_address.as_deref(),
             Some("0x104")

@@ -88,6 +88,8 @@ pub struct RawLib {
     #[serde(default)]
     pub breakpad_id: String,
     #[serde(default)]
+    pub code_id: Option<String>,
+    #[serde(default)]
     pub arch: Option<String>,
 }
 

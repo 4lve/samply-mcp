@@ -162,6 +162,7 @@ mod tests {
                 markers: vec![],
                 duration_ms: 20.0,
             }],
+            libraries: vec![],
             product: "test".to_string(),
             interval_ms: 2.0,
             categories: vec![],
