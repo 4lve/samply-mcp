@@ -1,17 +1,16 @@
 # samply-mcp
 
-An MCP server that lets AI assistants analyze [samply](https://github.com/mstange/samply) CPU profiles. Register it once, then ask Claude to analyze any profile by path — find hotspots, explore call trees, and explain what's slow.
+An MCP server that lets AI assistants analyze [samply](https://crates.io/crates/samply) CPU profiles. Register it once, then ask your assistant to analyze any profile by path — find hotspots, explore call trees, and explain what's slow.
 
 ## What it does
 
 ```
-$ samply record --save-only --unstable-presymbolicate -o profile.json.gz -- ./my-program
-$ claude mcp add samply /path/to/samply-mcp mcp
+$ cargo samply --samply-args="--save-only --unstable-presymbolicate --cswitch-markers --rate 500 --per-cpu-threads"
 ```
 
-Then in Claude Code, just ask:
+Then, from an AI assistant connected to this MCP server, just ask:
 
-> "What are the top CPU hotspots in /tmp/profile.json.gz?"
+> "What are the top CPU hotspots in /path/to/project/profile.json.gz?"
 > "Show me the call tree for the main thread"
 > "What's calling `vec::sort` the most?"
 
@@ -48,36 +47,37 @@ For Rust or Criterion profiles, pass `exclude_framework: true` or `user_code_onl
 
 ## Recording a Profile
 
-Install [samply](https://github.com/mstange/samply):
+Install [cargo-samply](https://crates.io/crates/cargo-samply) and [samply](https://crates.io/crates/samply):
 
 ```bash
+cargo install cargo-samply
 cargo install samply
 ```
 
-Record your program. The `--unstable-presymbolicate` flag writes a `.syms.json` sidecar that samply-mcp uses to resolve function names automatically:
+On Linux, samply may need access to performance events. This removes the running kernel's perf-event restrictions for unprivileged users until the setting is changed again or the system reboots:
 
 ```bash
-samply record --save-only --unstable-presymbolicate -o profile.json.gz -- ./target/profiling/my-program
-
+echo '-1' | sudo tee /proc/sys/kernel/perf_event_paranoid
 ```
 
-This produces `profile.json.gz` (and `profile.json.syms.json` alongside it). samply-mcp picks up the sidecar automatically — no manual symbolication needed.
-
-For scheduler and blocking analysis, record context-switch markers and per-CPU tracks together:
+From the Rust project you want to profile, run:
 
 ```bash
-samply record --save-only --per-cpu-threads --cswitch-markers \
-  --unstable-presymbolicate -o profile.json.gz -- ./target/profiling/my-program
+cargo samply --samply-args="--save-only --unstable-presymbolicate --cswitch-markers --rate 500 --per-cpu-threads"
 ```
 
-Then use `profile_context_switches` on an application thread. It reports observed on/off-CPU time, CPU usage and migration, `blocked` versus `preempted` switch-outs, and the longest off-CPU intervals. Off-CPU time following `blocked` includes the application's wait plus any delay before it runs again; context-switch markers alone cannot separate those two portions.
+`cargo-samply` builds an optimized binary with debug information and runs it under samply. With samply's default output path, the command produces `profile.json.gz` and a `profile.json.syms.json` sidecar in the current directory. samply-mcp picks up the sidecar automatically, so no manual symbolication is needed.
+
+The command above is the full Linux workflow. On macOS, omit `--per-cpu-threads`, which samply does not support there.
+
+The context-switch markers and per-CPU tracks enable `profile_context_switches`. It reports observed on/off-CPU time, CPU usage and migration, `blocked` versus `preempted` switch-outs, and the longest off-CPU intervals. Off-CPU time following `blocked` includes the application's wait plus any delay before it runs again; context-switch markers alone cannot separate those two portions.
 
 ## Installation
 
 Requires Rust 1.85+.
 
 ```bash
-git clone https://github.com/protortyp/samply-mcp
+git clone https://github.com/4lve/samply-mcp
 cd samply-mcp
 cargo build --release
 # Binary is at target/release/samply-mcp
@@ -85,10 +85,16 @@ cargo build --release
 
 ## MCP Server Setup
 
+### Codex CLI
+
+```bash
+codex mcp add samply -- /path/to/samply-mcp/target/release/samply-mcp mcp
+```
+
 ### Claude Code (CLI)
 
 ```bash
-claude mcp add samply /path/to/samply-mcp mcp
+claude mcp add samply -- /path/to/samply-mcp/target/release/samply-mcp mcp
 ```
 
 No profile path needed — profiles are loaded on-demand when tools are called.
@@ -101,7 +107,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 {
   "mcpServers": {
     "samply": {
-      "command": "/path/to/samply-mcp",
+      "command": "/path/to/samply-mcp/target/release/samply-mcp",
       "args": ["mcp"]
     }
   }
@@ -111,15 +117,14 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 ## Example Workflow
 
 ```bash
-# 1. Build your program (with debug info for best results)
-cargo build
+# 1. On Linux, allow access to performance events
+echo '-1' | sudo tee /proc/sys/kernel/perf_event_paranoid
 
-# 2. Record a profile
-samply record --save-only --unstable-presymbolicate \
-  -o /tmp/profile.json.gz -- ./target/debug/my-program
+# 2. Build and record a profile
+cargo samply --samply-args="--save-only --unstable-presymbolicate --cswitch-markers --rate 500 --per-cpu-threads"
 
 # 3. Register the MCP server (once, globally or per-project)
-claude mcp add samply ~/path/to/samply-mcp mcp
+codex mcp add samply -- /path/to/samply-mcp/target/release/samply-mcp mcp
 
-# 4. Open Claude Code and ask it to analyze by path
+# 4. Ask your assistant to analyze /path/to/project/profile.json.gz
 ```
