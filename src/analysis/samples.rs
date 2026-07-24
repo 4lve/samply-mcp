@@ -146,7 +146,7 @@ mod tests {
             timestamp_ms,
             weight: 1,
             cpu_delta_us: None,
-            stack: vec![],
+            stack: Default::default(),
         }
     }
 

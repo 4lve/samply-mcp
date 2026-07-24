@@ -427,7 +427,7 @@ fn inline_frames_for_leaf(sample: &ResolvedSample, leaf: &ResolvedFrame) -> Vec<
                     && instruction.library_debug_id == leaf_instruction.library_debug_id
             })
         })
-        .map(frame_source)
+        .map(|frame| frame_source(frame))
         .collect();
     frames.reverse();
 
@@ -517,13 +517,13 @@ mod tests {
                     timestamp_ms: 100.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![frame("tick", 0x104, 10)],
+                    stack: vec![frame("tick", 0x104, 10)].into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 102.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![frame("tick", 0x108, 11)],
+                    stack: vec![frame("tick", 0x108, 11)].into(),
                 },
             ],
             markers: vec![],

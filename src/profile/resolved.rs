@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use super::symbols::{SymbolAddressInfo, SymbolSidecar};
@@ -50,7 +52,37 @@ pub struct ResolvedSample {
     pub timestamp_ms: f64,
     pub weight: i32,
     pub cpu_delta_us: Option<i64>,
-    pub stack: Vec<ResolvedFrame>,
+    /// Root-first resolved stack shared by every sample with the same stack-table index.
+    pub stack: ResolvedStack,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedStack(Arc<[Arc<ResolvedFrame>]>);
+
+impl ResolvedStack {
+    pub fn ptr_eq(left: &Self, right: &Self) -> bool {
+        Arc::ptr_eq(&left.0, &right.0)
+    }
+}
+
+impl Deref for ResolvedStack {
+    type Target = [Arc<ResolvedFrame>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Vec<ResolvedFrame>> for ResolvedStack {
+    fn from(frames: Vec<ResolvedFrame>) -> Self {
+        Self(frames.into_iter().map(Arc::new).collect())
+    }
+}
+
+impl From<Vec<Arc<ResolvedFrame>>> for ResolvedStack {
+    fn from(frames: Vec<Arc<ResolvedFrame>>) -> Self {
+        Self(frames.into())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -80,45 +112,81 @@ pub struct ResolvedMarker {
     pub end_time: Option<f64>,
     pub phase: Option<u8>,
     pub category: String,
-    pub data: Option<serde_json::Value>,
+    pub data: Option<ResolvedMarkerData>,
+    pub context_switch: Option<ResolvedContextSwitchMarker>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedMarkerData {
+    raw: Arc<str>,
+    context: Arc<MarkerDataContext>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedContextSwitchMarker {
+    pub cpu: Arc<str>,
+    pub switch_out_reason: Arc<str>,
+}
+
+#[derive(Debug)]
+struct MarkerDataContext {
+    schema: Arc<[RawMarkerSchema]>,
+    strings: Arc<[String]>,
 }
 
 impl ResolvedProfile {
-    pub fn from_raw(raw: &RawProfile) -> Self {
+    pub fn from_raw(raw: RawProfile) -> Result<Self, serde_json::Error> {
         Self::from_raw_with_symbols(raw, None)
     }
 
-    pub(crate) fn from_raw_with_symbols(raw: &RawProfile, symbols: Option<&SymbolSidecar>) -> Self {
+    pub(crate) fn from_raw_with_symbols(
+        raw: RawProfile,
+        symbols: Option<&SymbolSidecar>,
+    ) -> Result<Self, serde_json::Error> {
         let categories: Vec<String> = raw.meta.categories.iter().map(|c| c.name.clone()).collect();
 
         // The string table can be in shared.stringArray (newer format) or per-thread
-        let shared_strings: Vec<String> = raw
+        let shared_strings: &[String] = raw
             .shared
             .as_ref()
-            .map(|s| s.string_array.clone())
+            .map(|s| s.string_array.as_slice())
             .unwrap_or_default();
+        let shared_marker_strings: Arc<[String]> = shared_strings.to_vec().into();
+        let marker_schema: Arc<[RawMarkerSchema]> = raw.meta.marker_schema.clone().into();
+        let thread_resolution = ThreadResolutionContext {
+            categories: &categories,
+            libs: &raw.libs,
+            marker_schema,
+            apply_symbol_names: !raw.meta.symbolicated,
+            symbols,
+        };
 
         let mut threads = Vec::new();
         let mut total_sample_count = 0;
         let mut global_min_time = f64::MAX;
         let mut global_max_time = f64::MIN;
 
-        for raw_thread in &raw.threads {
+        for raw_thread_json in raw.threads {
+            let raw_thread: RawThread = serde_json::from_str(&raw_thread_json.0)?;
+
             // Per-thread string table takes priority, fall back to shared
             let strings = if let Some(ref ts) = raw_thread.string_array {
                 ts
             } else {
-                &shared_strings
+                shared_strings
             };
+            let marker_strings = raw_thread
+                .markers
+                .as_ref()
+                .filter(|markers| markers.length > 0)
+                .map(|_| {
+                    raw_thread.string_array.as_ref().map_or_else(
+                        || Arc::clone(&shared_marker_strings),
+                        |strings| Arc::from(strings.clone()),
+                    )
+                });
 
-            let resolved = resolve_thread(
-                raw_thread,
-                strings,
-                &categories,
-                &raw.libs,
-                &raw.meta.marker_schema,
-                symbols,
-            );
+            let resolved = resolve_thread(&raw_thread, strings, marker_strings, &thread_resolution);
             total_sample_count += resolved.samples.len();
 
             for sample in &resolved.samples {
@@ -142,7 +210,7 @@ impl ResolvedProfile {
             0.0
         };
 
-        ResolvedProfile {
+        Ok(ResolvedProfile {
             threads,
             libraries: raw
                 .libs
@@ -162,18 +230,39 @@ impl ResolvedProfile {
             observed_start_time_ms,
             duration_ms,
             total_sample_count,
-        }
+        })
     }
+}
+
+impl ResolvedMarker {
+    pub fn data_value(&self) -> Option<serde_json::Value> {
+        let data = self.data.as_ref()?;
+        let mut data_value = serde_json::from_str(&data.raw).ok()?;
+        resolve_marker_strings(&mut data_value, &data.context.schema, &data.context.strings);
+        Some(data_value)
+    }
+}
+
+struct ThreadResolutionContext<'a> {
+    categories: &'a [String],
+    libs: &'a [super::types::RawLib],
+    marker_schema: Arc<[RawMarkerSchema]>,
+    apply_symbol_names: bool,
+    symbols: Option<&'a SymbolSidecar>,
 }
 
 fn resolve_thread(
     thread: &RawThread,
     strings: &[String],
-    categories: &[String],
-    libs: &[super::types::RawLib],
-    marker_schema: &[RawMarkerSchema],
-    symbols: Option<&SymbolSidecar>,
+    marker_strings: Option<Arc<[String]>>,
+    context: &ThreadResolutionContext<'_>,
 ) -> ResolvedThread {
+    let categories = context.categories;
+    let libs = context.libs;
+    let marker_schema = context.marker_schema.as_ref();
+    let apply_symbol_names = context.apply_symbol_names;
+    let symbols = context.symbols;
+
     let str_at = |idx: usize| -> String {
         strings
             .get(idx)
@@ -213,15 +302,12 @@ fn resolve_thread(
             .and_then(|l| l.get(i).copied().flatten());
         func_lines.push(line);
 
-        let res = thread.func_table.resource.as_ref().and_then(|r| {
-            r.get(i).and_then(|v| match v {
-                serde_json::Value::Number(n) => {
-                    let n = n.as_i64()?;
-                    if n < 0 { None } else { Some(n as usize) }
-                }
-                _ => None,
-            })
-        });
+        let res = thread
+            .func_table
+            .resource
+            .as_ref()
+            .and_then(|resources| resources.get(i).copied().flatten())
+            .and_then(|resource| usize::try_from(resource).ok());
         func_resource.push(res);
     }
 
@@ -264,7 +350,7 @@ fn resolve_thread(
                 .address
                 .as_ref()
                 .and_then(|addresses| addresses.get(i))
-                .and_then(nonnegative_u64),
+                .and_then(|address| address.and_then(|address| u64::try_from(address).ok())),
         );
         frame_inline_depth.push(
             thread
@@ -276,8 +362,65 @@ fn resolve_thread(
         );
     }
 
-    // Resolve a stack index into a Vec<ResolvedFrame> (leaf first, then reversed to root-first)
-    let resolve_stack = |stack_idx: usize| -> Vec<ResolvedFrame> {
+    // Resolve each frame once. Stacks contain cheap Arc pointers to these
+    // templates rather than cloning frame strings for every unique stack.
+    let resolved_frames: Vec<Arc<ResolvedFrame>> = (0..frame_count)
+        .map(|frame_idx| {
+            let fi = frame_func_idx[frame_idx];
+            let library_index =
+                func_resource
+                    .get(fi)
+                    .copied()
+                    .flatten()
+                    .and_then(|resource_index| {
+                        thread
+                            .resource_table
+                            .lib
+                            .as_ref()
+                            .and_then(|indices| indices.get(resource_index).copied().flatten())
+                    });
+            let library = library_index.and_then(|index| libs.get(index));
+            let instruction = frame_address[frame_idx].map(|address| {
+                let symbol = library.and_then(|library| {
+                    symbols.and_then(|symbols| {
+                        symbols
+                            .lookup(&library.breakpad_id, &library.debug_name, address)
+                            .cloned()
+                    })
+                });
+                ResolvedInstruction {
+                    address,
+                    inline_depth: frame_inline_depth[frame_idx],
+                    library_index,
+                    library_debug_id: library.map(|library| library.breakpad_id.clone()),
+                    symbol,
+                }
+            });
+            let function_name = instruction
+                .as_ref()
+                .filter(|instruction| apply_symbol_names && instruction.inline_depth == 0)
+                .and_then(|instruction| instruction.symbol.as_ref())
+                .map_or_else(
+                    || func_names.get(fi).cloned().unwrap_or_default(),
+                    |symbol| symbol.symbol_name.clone(),
+                );
+            Arc::new(ResolvedFrame {
+                function_name,
+                file: func_files.get(fi).cloned().flatten(),
+                line: frame_line[frame_idx].or_else(|| func_lines.get(fi).copied().flatten()),
+                category: frame_category[frame_idx].clone(),
+                library: func_resource
+                    .get(fi)
+                    .copied()
+                    .flatten()
+                    .and_then(&resource_lib_name),
+                instruction,
+            })
+        })
+        .collect();
+
+    // Resolve a stack index into frame pointers (leaf first, then reversed to root-first).
+    let resolve_stack = |stack_idx: usize| -> Vec<Arc<ResolvedFrame>> {
         let mut frames = Vec::new();
         let mut current = Some(stack_idx);
 
@@ -288,46 +431,7 @@ fn resolve_thread(
             let frame_idx = thread.stack_table.frame[idx];
 
             if frame_idx < frame_count {
-                let fi = frame_func_idx[frame_idx];
-                let library_index =
-                    func_resource
-                        .get(fi)
-                        .copied()
-                        .flatten()
-                        .and_then(|resource_index| {
-                            thread
-                                .resource_table
-                                .lib
-                                .as_ref()
-                                .and_then(|indices| indices.get(resource_index).copied().flatten())
-                        });
-                let library = library_index.and_then(|index| libs.get(index));
-                let instruction = frame_address[frame_idx].map(|address| ResolvedInstruction {
-                    address,
-                    inline_depth: frame_inline_depth[frame_idx],
-                    library_index,
-                    library_debug_id: library.map(|library| library.breakpad_id.clone()),
-                    symbol: library.and_then(|library| {
-                        symbols.and_then(|symbols| {
-                            symbols
-                                .lookup(&library.breakpad_id, &library.debug_name, address)
-                                .cloned()
-                        })
-                    }),
-                });
-                let frame = ResolvedFrame {
-                    function_name: func_names.get(fi).cloned().unwrap_or_default(),
-                    file: func_files.get(fi).cloned().flatten(),
-                    line: frame_line[frame_idx].or_else(|| func_lines.get(fi).copied().flatten()),
-                    category: frame_category[frame_idx].clone(),
-                    library: func_resource
-                        .get(fi)
-                        .copied()
-                        .flatten()
-                        .and_then(&resource_lib_name),
-                    instruction,
-                };
-                frames.push(frame);
+                frames.push(Arc::clone(&resolved_frames[frame_idx]));
             }
 
             current = thread.stack_table.prefix[idx];
@@ -337,9 +441,13 @@ fn resolve_thread(
         frames
     };
 
-    // Resolve samples
+    // Resolve samples. Firefox's processed-profile format interns stacks in the
+    // stack table, so preserve that sharing instead of cloning every frame and
+    // its strings into every sample.
     let sample_count = thread.samples.length;
     let mut samples = Vec::with_capacity(sample_count);
+    let mut resolved_stacks: Vec<Option<ResolvedStack>> = vec![None; thread.stack_table.length];
+    let empty_stack = ResolvedStack::default();
 
     // Reconstruct absolute timestamps from time deltas
     let timestamps = if let Some(ref time) = thread.samples.time {
@@ -357,9 +465,18 @@ fn resolve_thread(
     };
 
     for i in 0..sample_count {
-        let stack = thread.samples.stack[i]
-            .map(&resolve_stack)
-            .unwrap_or_default();
+        let stack = match thread.samples.stack[i] {
+            Some(stack_index) if stack_index < resolved_stacks.len() => {
+                if let Some(stack) = &resolved_stacks[stack_index] {
+                    stack.clone()
+                } else {
+                    let stack: ResolvedStack = resolve_stack(stack_index).into();
+                    resolved_stacks[stack_index] = Some(stack.clone());
+                    stack
+                }
+            }
+            _ => empty_stack.clone(),
+        };
 
         let weight = thread
             .samples
@@ -372,7 +489,7 @@ fn resolve_thread(
             .samples
             .thread_cpu_delta
             .as_ref()
-            .and_then(|d| d.get(i).and_then(|v| v.as_ref().and_then(|v| v.as_i64())));
+            .and_then(|deltas| deltas.get(i).copied().flatten());
 
         samples.push(ResolvedSample {
             timestamp_ms: timestamps.get(i).copied().unwrap_or(0.0),
@@ -384,6 +501,13 @@ fn resolve_thread(
 
     // Resolve markers
     let mut markers = Vec::new();
+    let mut marker_string_intern = HashMap::new();
+    let marker_data_context = marker_strings.map(|strings| {
+        Arc::new(MarkerDataContext {
+            schema: Arc::clone(&context.marker_schema),
+            strings,
+        })
+    });
     if let Some(ref marker_table) = thread.markers {
         let marker_count = marker_table.length;
         for i in 0..marker_count {
@@ -416,11 +540,25 @@ fn resolve_thread(
                 .map(&category_name)
                 .unwrap_or_else(|| "Other".to_string());
 
-            let mut data = marker_table
+            let data = marker_table
                 .data
                 .as_ref()
-                .and_then(|d| d.get(i).cloned().flatten());
-            resolve_marker_strings(&mut data, marker_schema, strings);
+                .and_then(|data| data.get(i).cloned().flatten())
+                .map(|data| data.0);
+            let context_switch = data.as_deref().and_then(|data| {
+                resolve_context_switch_marker(
+                    data,
+                    marker_schema,
+                    strings,
+                    &mut marker_string_intern,
+                )
+            });
+            let data = data
+                .zip(marker_data_context.as_ref())
+                .map(|(raw, context)| ResolvedMarkerData {
+                    raw,
+                    context: Arc::clone(context),
+                });
 
             markers.push(ResolvedMarker {
                 name,
@@ -429,6 +567,7 @@ fn resolve_thread(
                 phase,
                 category: cat,
                 data,
+                context_switch,
             });
         }
     }
@@ -480,18 +619,56 @@ fn resolve_thread(
     }
 }
 
-fn nonnegative_u64(value: &serde_json::Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+fn resolve_context_switch_marker(
+    raw_data: &str,
+    marker_schema: &[RawMarkerSchema],
+    strings: &[String],
+    intern: &mut HashMap<String, Arc<str>>,
+) -> Option<ResolvedContextSwitchMarker> {
+    let mut data = serde_json::from_str(raw_data).ok()?;
+    resolve_marker_strings(&mut data, marker_schema, strings);
+    let data = data.as_object()?;
+    if data.get("type")?.as_str()? != "OnCpu" {
+        return None;
+    }
+
+    let cpu = marker_string_field(data, "cpu")?;
+    let switch_out_reason =
+        marker_string_field(data, "outwhy").unwrap_or_else(|| "unknown".to_string());
+
+    Some(ResolvedContextSwitchMarker {
+        cpu: intern_marker_string(intern, cpu),
+        switch_out_reason: intern_marker_string(intern, switch_out_reason),
+    })
+}
+
+fn intern_marker_string(intern: &mut HashMap<String, Arc<str>>, value: String) -> Arc<str> {
+    if let Some(value) = intern.get(&value) {
+        return Arc::clone(value);
+    }
+
+    let interned: Arc<str> = Arc::from(value.as_str());
+    intern.insert(value, Arc::clone(&interned));
+    interned
+}
+
+fn marker_string_field(
+    data: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<String> {
+    match data.get(key)? {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn resolve_marker_strings(
-    data: &mut Option<serde_json::Value>,
+    data: &mut serde_json::Value,
     marker_schema: &[RawMarkerSchema],
     strings: &[String],
 ) {
-    let Some(serde_json::Value::Object(data)) = data else {
+    let serde_json::Value::Object(data) = data else {
         return;
     };
     let Some(marker_type) = data.get("type").and_then(serde_json::Value::as_str) else {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::profile::resolved::{ResolvedMarker, ResolvedThread};
 
@@ -6,16 +7,13 @@ use crate::profile::resolved::{ResolvedMarker, ResolvedThread};
 pub struct OnCpuInterval {
     pub start_time_ms: f64,
     pub end_time_ms: f64,
-    pub cpu: String,
-    pub switch_out_reason: String,
+    pub cpu: Arc<str>,
+    pub switch_out_reason: Arc<str>,
 }
 
 impl OnCpuInterval {
     fn from_marker(marker: &ResolvedMarker) -> Option<Self> {
-        let data = marker.data.as_ref()?.as_object()?;
-        if data.get("type")?.as_str()? != "OnCpu" {
-            return None;
-        }
+        let context_switch = marker.context_switch.as_ref()?;
 
         let start_time_ms = marker.start_time?;
         let end_time_ms = marker.end_time?;
@@ -26,21 +24,9 @@ impl OnCpuInterval {
         Some(Self {
             start_time_ms,
             end_time_ms,
-            cpu: marker_string_field(data, "cpu")?,
-            switch_out_reason: marker_string_field(data, "outwhy")
-                .unwrap_or_else(|| "unknown".to_string()),
+            cpu: context_switch.cpu.clone(),
+            switch_out_reason: context_switch.switch_out_reason.clone(),
         })
-    }
-}
-
-fn marker_string_field(
-    data: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Option<String> {
-    match data.get(key)? {
-        serde_json::Value::String(value) => Some(value.clone()),
-        serde_json::Value::Number(value) => Some(value.to_string()),
-        _ => None,
     }
 }
 
@@ -113,8 +99,8 @@ pub fn analyze_context_switches(
     }
 
     let observed_duration_ms = observed_end_time_ms - observed_start_time_ms;
-    let mut cpu_accum: HashMap<String, (usize, f64)> = HashMap::new();
-    let mut reason_accum: HashMap<String, (usize, f64)> = HashMap::new();
+    let mut cpu_accum: HashMap<Arc<str>, (usize, f64)> = HashMap::new();
+    let mut reason_accum: HashMap<Arc<str>, (usize, f64)> = HashMap::new();
     let mut on_cpu_time_ms = 0.0;
     let mut on_cpu_interval_count = 0;
     let mut switch_out_count = 0;
@@ -161,9 +147,9 @@ pub fn analyze_context_switches(
                     start_time_ms: start,
                     end_time_ms: end,
                     duration_ms: duration,
-                    reason: previous.switch_out_reason.clone(),
-                    previous_cpu: previous.cpu.clone(),
-                    next_cpu: next.cpu.clone(),
+                    reason: previous.switch_out_reason.to_string(),
+                    previous_cpu: previous.cpu.to_string(),
+                    next_cpu: next.cpu.to_string(),
                 });
             }
         }
@@ -181,7 +167,7 @@ pub fn analyze_context_switches(
     let mut cpus: Vec<CpuUsage> = cpu_accum
         .into_iter()
         .map(|(cpu, (interval_count, on_cpu_time_ms))| CpuUsage {
-            cpu,
+            cpu: cpu.to_string(),
             interval_count,
             on_cpu_time_ms,
         })
@@ -196,7 +182,7 @@ pub fn analyze_context_switches(
         .into_iter()
         .map(
             |(reason, (switch_count, observed_off_cpu_time_ms))| SwitchOutReason {
-                reason,
+                reason: reason.to_string(),
                 switch_count,
                 observed_off_cpu_time_ms,
             },
@@ -233,8 +219,7 @@ pub fn analyze_context_switches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::resolved::{ResolvedMarker, SampleWeightType};
-    use serde_json::json;
+    use crate::profile::resolved::{ResolvedContextSwitchMarker, ResolvedMarker, SampleWeightType};
 
     fn marker(start: f64, end: f64, cpu: &str, reason: &str) -> ResolvedMarker {
         ResolvedMarker {
@@ -243,7 +228,11 @@ mod tests {
             end_time: Some(end),
             phase: Some(1),
             category: "Other".to_string(),
-            data: Some(json!({"type": "OnCpu", "cpu": cpu, "outwhy": reason})),
+            data: None,
+            context_switch: Some(ResolvedContextSwitchMarker {
+                cpu: Arc::from(cpu),
+                switch_out_reason: Arc::from(reason),
+            }),
         }
     }
 

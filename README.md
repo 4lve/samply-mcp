@@ -34,7 +34,7 @@ Every tool accepts a `path` parameter, so one server installation works for any 
 | `profile_context_switches` | On/off-CPU time, CPU migration, switch-out reasons, and longest scheduling gaps |
 | `profile_flamegraph` | Collapsed stack format, optionally focused or aggregated by thread-name prefix |
 
-All tools require a `path` parameter pointing to a profile `.json` or `.json.gz` file. Profiles are loaded on first use and cached in memory.
+All tools require a `path` parameter pointing to a profile `.json` or `.json.gz` file. The most recently used profile is cached in memory. Concurrent requests for the same path share one load; requests for different paths are serialized so multiple large profiles are not inflated and retained at once. Large profiles are decoded one thread at a time, and repeated stacks, frames, marker strings, and analysis results remain shared or lazy.
 
 Sample-based tools accept optional `start_time_ms` and `end_time_ms` bounds. The bounds are inclusive, measured relative to the first observed sample (`0` is profile start), and are applied before thread selection, totals, percentages, and tree construction. Results include an `effective_range` showing the requested range after it was clamped to the profile. `profile_info.observed_start_time_ms` exposes the first sample's original timestamp so profile-relative results can be aligned with logs that use the host-monotonic clock.
 

@@ -22,7 +22,7 @@ src/
 ├── profile/
 │   ├── types.rs         # Serde types for Firefox Profiler JSON
 │   ├── parse.rs         # Gzip decompression + JSON deserialization
-│   ├── resolved.rs      # Denormalized profile with resolved index references
+│   ├── resolved.rs      # Resolved profile with shared, interned sample stacks
 │   ├── symbols.rs       # Samply .syms.json address, source-line, and inline-frame fallback
 │   └── dwarf.rs         # Verified recorded-binary per-PC DWARF resolver
 └── analysis/
@@ -62,7 +62,7 @@ Prefer `thread_index` or `tid` from `profile_threads` when selecting one thread;
 samply-mcp mcp
 ```
 
-Starts an MCP server on stdio. Profiles are loaded on-demand when tools are called with a `path` parameter, and cached in memory for subsequent requests.
+Starts an MCP server on stdio. Profiles are loaded on-demand when tools are called with a `path` parameter. Same-path requests share one load, different profile paths are serialized, and only the most recently used profile remains cached.
 
 ## Test Fixtures
 

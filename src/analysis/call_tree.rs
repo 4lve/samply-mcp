@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::analysis::samples::{self, AnalysisRange};
 use crate::analysis::symbols;
@@ -313,7 +314,7 @@ pub fn build_focused_call_tree_under_caller_with_filter(
 }
 
 pub fn function_under_caller_index(
-    stack: &[ResolvedFrame],
+    stack: &[Arc<ResolvedFrame>],
     function_name: &str,
     caller_name: &str,
     caller_relationship: CallerRelationship,
@@ -508,19 +509,19 @@ mod tests {
                     timestamp_ms: 0.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("foo"), make_frame("bar")],
+                    stack: vec![make_frame("main"), make_frame("foo"), make_frame("bar")].into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 10.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("foo")],
+                    stack: vec![make_frame("main"), make_frame("foo")].into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 20.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("baz")],
+                    stack: vec![make_frame("main"), make_frame("baz")].into(),
                 },
             ],
         };
@@ -548,25 +549,25 @@ mod tests {
                     timestamp_ms: 0.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("foo"), make_frame("bar")],
+                    stack: vec![make_frame("main"), make_frame("foo"), make_frame("bar")].into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 10.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("foo"), make_frame("baz")],
+                    stack: vec![make_frame("main"), make_frame("foo"), make_frame("baz")].into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 20.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("other")],
+                    stack: vec![make_frame("main"), make_frame("other")].into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 30.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("other")],
+                    stack: vec![make_frame("main"), make_frame("other")].into(),
                 },
             ],
         };
@@ -584,12 +585,13 @@ mod tests {
 
     #[test]
     fn function_under_caller_distinguishes_ancestor_and_immediate() {
-        let stack = vec![
+        let stack: crate::profile::resolved::ResolvedStack = vec![
             make_frame("main"),
             make_frame("finish_generation_status"),
             make_frame("fluid_system"),
             make_frame("WaterFluid::tick"),
-        ];
+        ]
+        .into();
 
         assert_eq!(
             function_under_caller_index(
@@ -631,7 +633,8 @@ mod tests {
                         make_frame("finish_generation_status"),
                         make_frame("WaterFluid::tick"),
                         make_frame("child"),
-                    ],
+                    ]
+                    .into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 10.0,
@@ -641,7 +644,8 @@ mod tests {
                         make_frame("main"),
                         make_frame("finish_generation_status"),
                         make_frame("WaterFluid::tick"),
-                    ],
+                    ]
+                    .into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 20.0,
@@ -651,7 +655,8 @@ mod tests {
                         make_frame("main"),
                         make_frame("other_status"),
                         make_frame("WaterFluid::tick"),
-                    ],
+                    ]
+                    .into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 30.0,
@@ -661,7 +666,8 @@ mod tests {
                         make_frame("main"),
                         make_frame("finish_generation_status"),
                         make_frame("LavaFluid::tick"),
-                    ],
+                    ]
+                    .into(),
                 },
             ],
         };

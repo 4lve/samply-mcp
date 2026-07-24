@@ -1,8 +1,9 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
+use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use anyhow::Result;
@@ -26,17 +27,29 @@ use crate::profile::resolved::{ResolvedProfile, ResolvedThread};
 /// Pre-computed analysis data cached per thread
 #[derive(Debug)]
 struct AnalysisCache {
-    function_stats: Vec<Vec<FunctionStats>>,
+    function_stats: Vec<OnceLock<Vec<FunctionStats>>>,
 }
 
 impl AnalysisCache {
     fn build(profile: &ResolvedProfile) -> Self {
-        let function_stats = profile
-            .threads
-            .iter()
-            .map(|thread| functions::compute_function_stats(thread, profile.interval_ms, None))
+        let function_stats = (0..profile.threads.len())
+            .map(|_| OnceLock::new())
             .collect();
         AnalysisCache { function_stats }
+    }
+
+    fn function_stats<'a>(
+        &'a self,
+        profile: &ResolvedProfile,
+        thread_index: usize,
+    ) -> Option<&'a Vec<FunctionStats>> {
+        let stats = self.function_stats.get(thread_index)?;
+        let thread = profile.threads.get(thread_index)?;
+        Some(
+            stats.get_or_init(|| {
+                functions::compute_function_stats(thread, profile.interval_ms, None)
+            }),
+        )
     }
 }
 
@@ -45,6 +58,56 @@ struct CachedProfile {
     profile: Arc<ResolvedProfile>,
     cache: Arc<AnalysisCache>,
     fingerprint: ProfileFingerprint,
+}
+
+struct ProfileCacheEntry {
+    path: PathBuf,
+    profile: Arc<CachedProfile>,
+}
+
+#[derive(Default)]
+struct ProfileCacheState {
+    entry: Option<ProfileCacheEntry>,
+    active_path: Option<PathBuf>,
+    active_requests: usize,
+    loading_path: Option<PathBuf>,
+    waiters: HashMap<PathBuf, usize>,
+    #[cfg(test)]
+    loads_started: usize,
+}
+
+#[derive(Default)]
+struct ProfileCache {
+    state: Mutex<ProfileCacheState>,
+    idle: Condvar,
+}
+
+struct CachedProfileLease {
+    cached: Arc<CachedProfile>,
+    owner: Arc<ProfileCache>,
+    path: PathBuf,
+}
+
+impl Deref for CachedProfileLease {
+    type Target = CachedProfile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cached
+    }
+}
+
+impl Drop for CachedProfileLease {
+    fn drop(&mut self) {
+        let mut state = self.owner.state.lock().unwrap();
+        debug_assert_eq!(state.active_path.as_ref(), Some(&self.path));
+        debug_assert!(state.active_requests > 0);
+
+        state.active_requests -= 1;
+        if state.active_requests == 0 {
+            state.active_path = None;
+            self.owner.idle.notify_all();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +150,7 @@ impl ProfileFingerprint {
 
 #[derive(Clone)]
 pub struct ProfileServer {
-    profiles: Arc<Mutex<HashMap<PathBuf, Arc<CachedProfile>>>>,
+    profiles: Arc<ProfileCache>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -101,40 +164,123 @@ impl std::fmt::Debug for ProfileServer {
 impl ProfileServer {
     pub fn new() -> Self {
         Self {
-            profiles: Arc::new(Mutex::new(HashMap::new())),
+            profiles: Arc::new(ProfileCache::default()),
             tool_router: Self::tool_router(),
         }
     }
 
-    fn get_profile(&self, path: &str) -> Result<Arc<CachedProfile>, String> {
+    fn get_profile(&self, path: &str) -> Result<CachedProfileLease, String> {
         let canonical =
             std::fs::canonicalize(path).map_err(|e| format!("Invalid path '{}': {}", path, e))?;
-        let fingerprint = ProfileFingerprint::read(&canonical)?;
 
-        {
-            let cache = self.profiles.lock().unwrap();
-            if let Some(cached) = cache.get(&canonical)
-                && cached.fingerprint == fingerprint
+        let mut state = self.profiles.state.lock().unwrap();
+        *state.waiters.entry(canonical.clone()).or_default() += 1;
+
+        loop {
+            if state.loading_path.is_some() {
+                state = self.profiles.idle.wait(state).unwrap();
+                continue;
+            }
+
+            if state
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.path == canonical)
             {
-                return Ok(Arc::clone(cached));
+                let fingerprint = match ProfileFingerprint::read(&canonical) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(error) => {
+                        remove_profile_waiter(&mut state, &canonical);
+                        self.profiles.idle.notify_all();
+                        return Err(error);
+                    }
+                };
+                if let Some(profile) = state.entry.as_ref().and_then(|entry| {
+                    (entry.profile.fingerprint == fingerprint).then(|| Arc::clone(&entry.profile))
+                }) {
+                    remove_profile_waiter(&mut state, &canonical);
+                    state.active_path = Some(canonical.clone());
+                    state.active_requests += 1;
+                    return Ok(CachedProfileLease {
+                        cached: profile,
+                        owner: Arc::clone(&self.profiles),
+                        path: canonical,
+                    });
+                }
+            }
+
+            if state.active_requests > 0 {
+                state = self.profiles.idle.wait(state).unwrap();
+                continue;
+            }
+
+            // Let requests already waiting for the resident path consume it
+            // before a different path evicts it. This turns a concurrent
+            // info/threads pair into one load even when cross-path waiters race.
+            let resident_has_waiters = state.entry.as_ref().is_some_and(|entry| {
+                entry.path != canonical && state.waiters.get(&entry.path).copied().unwrap_or(0) > 0
+            });
+            if resident_has_waiters {
+                state = self.profiles.idle.wait(state).unwrap();
+                continue;
+            }
+
+            remove_profile_waiter(&mut state, &canonical);
+            state.entry = None;
+            state.loading_path = Some(canonical.clone());
+            #[cfg(test)]
+            {
+                state.loads_started += 1;
+            }
+            drop(state);
+
+            let loaded = (|| {
+                let profile = load_profile(&canonical)
+                    .map_err(|e| format!("Failed to load profile '{}': {}", path, e))?;
+                let analysis_cache = AnalysisCache::build(&profile);
+                let fingerprint = ProfileFingerprint::read(&canonical)?;
+                Ok::<_, String>(Arc::new(CachedProfile {
+                    profile: Arc::new(profile),
+                    cache: Arc::new(analysis_cache),
+                    fingerprint,
+                }))
+            })();
+
+            state = self.profiles.state.lock().unwrap();
+            debug_assert_eq!(state.loading_path.as_ref(), Some(&canonical));
+            state.loading_path = None;
+
+            match loaded {
+                Ok(cached) => {
+                    state.entry = Some(ProfileCacheEntry {
+                        path: canonical.clone(),
+                        profile: Arc::clone(&cached),
+                    });
+                    state.active_path = Some(canonical.clone());
+                    state.active_requests += 1;
+                    self.profiles.idle.notify_all();
+                    return Ok(CachedProfileLease {
+                        cached,
+                        owner: Arc::clone(&self.profiles),
+                        path: canonical,
+                    });
+                }
+                Err(error) => {
+                    self.profiles.idle.notify_all();
+                    return Err(error);
+                }
             }
         }
+    }
+}
 
-        let profile = load_profile(&canonical)
-            .map_err(|e| format!("Failed to load profile '{}': {}", path, e))?;
-        let analysis_cache = AnalysisCache::build(&profile);
-        let fingerprint = ProfileFingerprint::read(&canonical)?;
-        let cached = Arc::new(CachedProfile {
-            profile: Arc::new(profile),
-            cache: Arc::new(analysis_cache),
-            fingerprint,
-        });
-
-        self.profiles
-            .lock()
-            .unwrap()
-            .insert(canonical, Arc::clone(&cached));
-        Ok(cached)
+fn remove_profile_waiter(state: &mut ProfileCacheState, path: &PathBuf) {
+    let Some(waiter_count) = state.waiters.get_mut(path) else {
+        return;
+    };
+    *waiter_count -= 1;
+    if *waiter_count == 0 {
+        state.waiters.remove(path);
     }
 }
 
@@ -643,8 +789,7 @@ fn function_stats_for_thread(
     if range.is_full_profile(&cached.profile) {
         return cached
             .cache
-            .function_stats
-            .get(thread_index)
+            .function_stats(&cached.profile, thread_index)
             .cloned()
             .unwrap_or_default();
     }
@@ -3315,7 +3460,7 @@ impl ProfileServer {
                 end_time: m.end_time,
                 phase: m.phase,
                 category: m.category.clone(),
-                data: m.data.clone(),
+                data: m.data_value(),
             })
             .collect();
 
@@ -3521,7 +3666,9 @@ impl ServerHandler for ProfileServer {
                  Result rows include display_name for compact Rust symbols and source when \
                  file/line data is present. Sample-based tools accept inclusive `start_time_ms` \
                  and `end_time_ms` bounds relative to profile start and return `effective_range`. \
-                 Focused trees show both focus and thread percentages."
+                 Concurrent requests for one profile share its load; requests for different \
+                 paths are serialized to bound memory. Focused trees show both focus and thread \
+                 percentages."
                     .to_string(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -3562,7 +3709,7 @@ mod tests {
             timestamp_ms: 0.0,
             weight: 1,
             cpu_delta_us: None,
-            stack: vec![],
+            stack: Default::default(),
         }
     }
 
@@ -3622,7 +3769,12 @@ mod tests {
                     "frameTable": {{ "length": 1, "func": [0], "category": [0] }},
                     "funcTable": {{ "length": 1, "name": [0] }},
                     "stackTable": {{ "length": 1, "prefix": [null], "frame": [0] }},
-                    "samples": {{ "length": 1, "stack": [0], "time": [0], "weight": [1] }},
+                    "samples": {{
+                        "length": 2,
+                        "stack": [0, 0],
+                        "time": [0, 1],
+                        "weight": [1, 1]
+                    }},
                     "resourceTable": {{ "length": 0 }},
                     "nativeSymbols": {{ "length": 0 }},
                     "stringArray": ["root_function"]
@@ -3914,11 +4066,146 @@ mod tests {
         let server = ProfileServer::new();
         let first = server.get_profile(path.to_str().unwrap()).unwrap();
         assert_eq!(first.profile.threads[0].name, "first");
+        drop(first);
 
         rewrite_after_mtime_change(&path, || profile_json("second"));
 
         let second = server.get_profile(path.to_str().unwrap()).unwrap();
         assert_eq!(second.profile.threads[0].name, "second");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repeated_sample_stacks_share_one_resolved_allocation() {
+        let dir = unique_test_dir("shared-stacks");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("profile.json");
+        write_profile(&path, "shared");
+
+        let server = ProfileServer::new();
+        let cached = server.get_profile(path.to_str().unwrap()).unwrap();
+        let samples = &cached.profile.threads[0].samples;
+
+        assert_eq!(samples.len(), 2);
+        assert!(crate::profile::resolved::ResolvedStack::ptr_eq(
+            &samples[0].stack,
+            &samples[1].stack
+        ));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn metadata_queries_do_not_build_function_statistics() {
+        let dir = unique_test_dir("lazy-analysis-cache");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("profile.json");
+        write_profile(&path, "lazy");
+        let path = path.to_string_lossy().into_owned();
+
+        let server = ProfileServer::new();
+        let cached = server.get_profile(&path).unwrap();
+        assert!(cached.cache.function_stats[0].get().is_none());
+
+        server
+            .profile_info(Parameters(ProfileInfoRequest { path: path.clone() }))
+            .unwrap();
+        assert!(cached.cache.function_stats[0].get().is_none());
+
+        let range = AnalysisRange::resolve(&cached.profile, None, None).unwrap();
+        let stats = function_stats_for_thread(&cached, 0, &range);
+        assert!(!stats.is_empty());
+        assert!(cached.cache.function_stats[0].get().is_some());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_path_requests_share_one_cached_profile() {
+        use std::sync::Barrier;
+
+        let dir = unique_test_dir("single-flight");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("profile.json");
+        write_profile(&path, "shared");
+
+        let server = Arc::new(ProfileServer::new());
+        let start = Arc::new(Barrier::new(9));
+        let release = Arc::new(Barrier::new(9));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut workers = Vec::new();
+
+        for _ in 0..8 {
+            let server = Arc::clone(&server);
+            let path = path.clone();
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
+            let sender = sender.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let cached = server.get_profile(path.to_str().unwrap()).unwrap();
+                sender.send(Arc::as_ptr(&cached.cached) as usize).unwrap();
+                release.wait();
+            }));
+        }
+        drop(sender);
+
+        start.wait();
+        let pointers: Vec<usize> = receiver.iter().take(8).collect();
+        assert_eq!(pointers.len(), 8);
+        assert!(pointers.iter().all(|pointer| *pointer == pointers[0]));
+        let state = server.profiles.state.lock().unwrap();
+        assert_eq!(state.active_requests, 8);
+        assert_eq!(state.loads_started, 1);
+        drop(state);
+
+        release.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn different_profile_paths_wait_for_the_active_profile() {
+        let dir = unique_test_dir("profile-serialization");
+        std::fs::create_dir(&dir).unwrap();
+        let first_path = dir.join("first.json");
+        let second_path = dir.join("second.json");
+        write_profile(&first_path, "first");
+        write_profile(&second_path, "second");
+
+        let server = Arc::new(ProfileServer::new());
+        let first = server.get_profile(first_path.to_str().unwrap()).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_server = Arc::clone(&server);
+        let worker = std::thread::spawn(move || {
+            let second = worker_server
+                .get_profile(second_path.to_str().unwrap())
+                .unwrap();
+            sender.send(second.profile.threads[0].name.clone()).unwrap();
+        });
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(first);
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "second"
+        );
+        worker.join().unwrap();
+
+        let state = server.profiles.state.lock().unwrap();
+        assert_eq!(
+            state.entry.as_ref().unwrap().path.file_name().unwrap(),
+            "second.json"
+        );
+        assert_eq!(state.loads_started, 2);
+        drop(state);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3952,8 +4239,9 @@ mod tests {
         let cached = server.get_profile(path.to_str().unwrap()).unwrap();
         let first_marker = &cached.profile.threads[0].markers[0];
         assert_eq!(first_marker.phase, Some(1));
-        assert_eq!(first_marker.data.as_ref().unwrap()["cpu"], "CPU 0");
-        assert_eq!(first_marker.data.as_ref().unwrap()["outwhy"], "blocked");
+        let first_marker_data = first_marker.data_value().unwrap();
+        assert_eq!(first_marker_data["cpu"], "CPU 0");
+        assert_eq!(first_marker_data["outwhy"], "blocked");
 
         let Json(result) = server
             .profile_context_switches(Parameters(ContextSwitchesRequest {

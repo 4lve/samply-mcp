@@ -1,4 +1,22 @@
+use std::sync::Arc;
+
 use serde::Deserialize;
+use serde_json::value::RawValue;
+
+/// Arbitrary JSON retained as compact source text instead of a heap-heavy
+/// `serde_json::Value` tree.
+#[derive(Debug, Clone)]
+pub struct RawJson(pub Arc<str>);
+
+impl<'de> Deserialize<'de> for RawJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        Ok(Self(Arc::from(raw.get())))
+    }
+}
 
 /// Top-level profile JSON structure
 #[derive(Debug, Deserialize)]
@@ -8,7 +26,7 @@ pub struct RawProfile {
     pub libs: Vec<RawLib>,
     #[serde(default)]
     pub shared: Option<RawShared>,
-    pub threads: Vec<RawThread>,
+    pub threads: Vec<RawJson>,
 }
 
 /// Shared data (contains the global string table)
@@ -56,7 +74,7 @@ pub struct RawCategory {
     pub subcategories: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawMarkerSchema {
     pub name: String,
@@ -66,7 +84,7 @@ pub struct RawMarkerSchema {
     pub data: Vec<RawMarkerSchemaField>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawMarkerSchemaField {
     #[serde(default)]
@@ -136,7 +154,7 @@ pub struct RawFrameTable {
     #[serde(default)]
     pub column: Option<Vec<Option<u32>>>,
     #[serde(default)]
-    pub address: Option<Vec<serde_json::Value>>,
+    pub address: Option<Vec<Option<i64>>>,
     #[serde(default)]
     pub native_symbol: Option<Vec<Option<usize>>>,
     #[serde(default)]
@@ -154,7 +172,7 @@ pub struct RawFuncTable {
     #[serde(default)]
     pub relevant_for_js: Option<Vec<bool>>,
     #[serde(default)]
-    pub resource: Option<Vec<serde_json::Value>>,
+    pub resource: Option<Vec<Option<i64>>>,
     #[serde(default)]
     pub file_name: Option<Vec<Option<usize>>>,
     #[serde(default)]
@@ -188,7 +206,7 @@ pub struct RawSampleTable {
     pub weight_type: Option<String>,
     #[serde(rename = "threadCPUDelta")]
     #[serde(default)]
-    pub thread_cpu_delta: Option<Vec<Option<serde_json::Value>>>,
+    pub thread_cpu_delta: Option<Vec<Option<i64>>>,
 }
 
 /// Resource table
@@ -220,7 +238,7 @@ pub struct RawMarkerTable {
     #[serde(default)]
     pub category: Option<Vec<usize>>,
     #[serde(default)]
-    pub data: Option<Vec<Option<serde_json::Value>>>,
+    pub data: Option<Vec<Option<RawJson>>>,
 }
 
 /// Native symbols table

@@ -46,7 +46,7 @@ pub fn compute_function_stats(
 
         // Total-time goes to all unique frames in the stack
         let mut seen = std::collections::HashSet::new();
-        for frame in &sample.stack {
+        for frame in sample.stack.iter() {
             if seen.insert(&frame.function_name) {
                 let entry = stats_map
                     .entry(frame.function_name.clone())
@@ -136,25 +136,25 @@ mod tests {
                     timestamp_ms: 0.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("foo"), make_frame("bar")],
+                    stack: vec![make_frame("main"), make_frame("foo"), make_frame("bar")].into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 10.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("foo")],
+                    stack: vec![make_frame("main"), make_frame("foo")].into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 20.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("baz")],
+                    stack: vec![make_frame("main"), make_frame("baz")].into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 30.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("foo"), make_frame("bar")],
+                    stack: vec![make_frame("main"), make_frame("foo"), make_frame("bar")].into(),
                 },
             ],
         };
@@ -184,13 +184,13 @@ mod tests {
                     timestamp_ms: 0.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("work")],
+                    stack: vec![make_frame("main"), make_frame("work")].into(),
                 },
                 ResolvedSample {
                     timestamp_ms: 1_000.0,
                     weight: 1,
                     cpu_delta_us: None,
-                    stack: vec![make_frame("main"), make_frame("work")],
+                    stack: vec![make_frame("main"), make_frame("work")].into(),
                 },
             ],
         };
