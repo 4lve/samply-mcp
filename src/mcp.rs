@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -21,7 +21,9 @@ use crate::analysis::functions::{self, FunctionStats};
 use crate::analysis::samples::{self, AnalysisRange};
 use crate::analysis::source;
 use crate::analysis::symbols;
-use crate::c2c::{C2cCallchainFrame, C2cProfile, C2cSample, MappedInstruction};
+use crate::c2c::{
+    C2cCallchainFrame, C2cProfile, C2cSample, C2cStats, MappedDataAddress, MappedInstruction,
+};
 use crate::profile::dwarf::DwarfLibraryResolver;
 use crate::profile::parse::{find_syms_sidecar, load_profile};
 use crate::profile::resolved::{ResolvedLibrary, ResolvedProfile, ResolvedThread};
@@ -1225,8 +1227,31 @@ struct C2cAccessKey {
     cpu: u32,
     thread_name: Arc<str>,
     instruction_address: u64,
+    exact_ip: bool,
     data_source: crate::c2c::MemoryDataSource,
+    mapped_data_address: Option<MappedDataAddress>,
     mapped_instruction: Option<MappedInstruction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct C2cDataMappingKey {
+    path: Arc<str>,
+    mapping_start: u64,
+    mapping_end: u64,
+    page_offset: u64,
+    build_id: Option<Arc<str>>,
+}
+
+impl From<&MappedDataAddress> for C2cDataMappingKey {
+    fn from(mapped: &MappedDataAddress) -> Self {
+        Self {
+            path: Arc::clone(&mapped.path),
+            mapping_start: mapped.mapping_start,
+            mapping_end: mapped.mapping_end,
+            page_offset: mapped.page_offset,
+            build_id: mapped.build_id.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1300,6 +1325,7 @@ struct C2cSiteAccum {
     pids: BTreeSet<i32>,
     tids: BTreeSet<i32>,
     thread_names: BTreeSet<String>,
+    data_sources: HashMap<crate::c2c::MemoryDataSource, C2cStats>,
     grouped_callchain: Option<Arc<[C2cCallchainFrame]>>,
     callchains: HashMap<Arc<[C2cInstructionIdentity]>, C2cCallchainAccum>,
 }
@@ -1316,6 +1342,7 @@ impl C2cSiteAccum {
             pids: BTreeSet::new(),
             tids: BTreeSet::new(),
             thread_names: BTreeSet::new(),
+            data_sources: HashMap::new(),
             grouped_callchain,
             callchains: HashMap::new(),
         }
@@ -1340,6 +1367,10 @@ impl C2cSiteAccum {
         self.pids.insert(sample.pid);
         self.tids.insert(sample.tid);
         self.thread_names.insert(sample.thread_name.to_string());
+        self.data_sources
+            .entry(sample.data_source)
+            .or_default()
+            .add_sample(sample);
 
         if include_callchains && !sample.callchain.is_empty() {
             let identity: Arc<[C2cInstructionIdentity]> = sample
@@ -1372,6 +1403,7 @@ struct C2cDetailedCachelineAccum {
     stats: C2cStats,
     physical_cachelines: BTreeSet<u64>,
     offsets: HashMap<u64, C2cStats>,
+    data_mappings: HashMap<C2cDataMappingKey, C2cStats>,
 }
 
 impl C2cDetailedCachelineAccum {
@@ -1386,6 +1418,12 @@ impl C2cDetailedCachelineAccum {
             .entry(sample.data_address - cacheline)
             .or_default()
             .add_sample(sample);
+        if let Some(mapped) = &sample.mapped_data_address {
+            self.data_mappings
+                .entry(mapped.into())
+                .or_default()
+                .add_sample(sample);
+        }
     }
 }
 
@@ -1512,14 +1550,37 @@ fn c2c_profile_summary(profile: &C2cProfile, matched_memory_samples: usize) -> C
     let mut warnings = Vec::new();
     if profile.missing_data_address_samples > 0 {
         warnings.push(format!(
-            "{} memory samples had no data address and were excluded",
-            profile.missing_data_address_samples
+            "{} of {} memory sample records had no data address and were excluded; {} usable memory samples remain",
+            profile.missing_data_address_samples,
+            profile.memory_sample_records,
+            profile.samples.len()
         ));
     }
     if profile.missing_physical_address_samples > 0 {
         warnings.push(format!(
             "{} memory samples had no physical address; physical cacheline reporting may be incomplete",
             profile.missing_physical_address_samples
+        ));
+    }
+    if profile.global_stats.instruction_latency_samples == 0 {
+        warnings.push(
+            "no usable memory sample contains instruction-latency data; latency averages are unavailable and latency sorting is rejected"
+                .to_string(),
+        );
+    }
+    if profile.global_stats.non_unit_weight_samples == 0 {
+        warnings.push(
+            "all usable memory samples have weight 1; weight totals do not estimate latency or wall time"
+                .to_string(),
+        );
+    }
+    let non_exact_ip_samples = profile
+        .global_stats
+        .samples
+        .saturating_sub(profile.global_stats.exact_ip_samples);
+    if non_exact_ip_samples > 0 {
+        warnings.push(format!(
+            "{non_exact_ip_samples} usable memory samples lack PERF_RECORD_MISC_EXACT_IP; instruction attribution uses the unmodified sampled IP and may have skid"
         ));
     }
     warnings.push(format!(
@@ -1539,13 +1600,92 @@ fn c2c_profile_summary(profile: &C2cProfile, matched_memory_samples: usize) -> C
             .map_or(0.0, |(first, last)| {
                 last.saturating_sub(first) as f64 / 1_000_000.0
             }),
-        total_memory_samples: profile.samples.len(),
+        total_sample_records: profile.memory_sample_records + profile.skipped_samples,
+        total_memory_samples: profile.memory_sample_records,
+        usable_memory_samples: profile.samples.len(),
+        instruction_ip_policy: "raw_perf_sample_ip_no_adjustment".to_string(),
+        global_stats: c2c_stats_result(&profile.global_stats),
+        global_memory_levels: c2c_memory_level_rows(&profile.global_memory_levels),
         samples_with_callchains: profile.samples_with_callchains,
         matched_memory_samples,
         skipped_non_memory_samples: profile.skipped_samples,
         missing_data_address_samples: profile.missing_data_address_samples,
         missing_physical_address_samples: profile.missing_physical_address_samples,
         warnings,
+    }
+}
+
+fn c2c_memory_level_rows(levels: &BTreeMap<&'static str, C2cStats>) -> Vec<C2cMemoryLevelRow> {
+    let mut levels: Vec<_> = levels.iter().collect();
+    levels.sort_unstable_by(|(left_level, left), (right_level, right)| {
+        right
+            .samples
+            .cmp(&left.samples)
+            .then_with(|| left_level.cmp(right_level))
+    });
+    levels
+        .into_iter()
+        .map(|(memory_level, stats)| C2cMemoryLevelRow {
+            memory_level: (*memory_level).to_string(),
+            stats: c2c_stats_result(stats),
+        })
+        .collect()
+}
+
+fn c2c_raw_data_source_rows(
+    data_sources: HashMap<crate::c2c::MemoryDataSource, C2cStats>,
+) -> Vec<C2cRawDataSourceRow> {
+    let mut data_sources: Vec<_> = data_sources.into_iter().collect();
+    data_sources.sort_unstable_by(|(left_source, left), (right_source, right)| {
+        right
+            .samples
+            .cmp(&left.samples)
+            .then_with(|| left_source.raw.cmp(&right_source.raw))
+    });
+    data_sources
+        .into_iter()
+        .map(|(source, stats)| C2cRawDataSourceRow {
+            raw_data_source: format!("0x{:x}", source.raw),
+            operation: source.operation().to_string(),
+            memory_level: source.level().to_string(),
+            stats: c2c_stats_result(&stats),
+        })
+        .collect()
+}
+
+fn c2c_data_mapping_rows(
+    data_mappings: HashMap<C2cDataMappingKey, C2cStats>,
+) -> Vec<C2cDataMappingRow> {
+    let mut data_mappings: Vec<_> = data_mappings.into_iter().collect();
+    data_mappings.sort_unstable_by(|(left_key, left), (right_key, right)| {
+        right
+            .samples
+            .cmp(&left.samples)
+            .then_with(|| left_key.path.cmp(&right_key.path))
+            .then_with(|| left_key.mapping_start.cmp(&right_key.mapping_start))
+    });
+    data_mappings
+        .into_iter()
+        .map(|(mapping, stats)| C2cDataMappingRow {
+            path: mapping.path.to_string(),
+            mapping_start: format_address(mapping.mapping_start),
+            mapping_end: format_address(mapping.mapping_end),
+            page_offset: format_address(mapping.page_offset),
+            build_id: mapping.build_id.map(|build_id| build_id.to_string()),
+            stats: c2c_stats_result(&stats),
+        })
+        .collect()
+}
+
+fn c2c_mapped_data_address(mapped: MappedDataAddress) -> C2cMappedDataAddress {
+    C2cMappedDataAddress {
+        path: mapped.path.to_string(),
+        mapping_start: format_address(mapped.mapping_start),
+        mapping_end: format_address(mapped.mapping_end),
+        page_offset: format_address(mapped.page_offset),
+        mapping_offset: format_address(mapped.mapping_offset),
+        file_offset: format_address(mapped.file_offset),
+        build_id: mapped.build_id.map(|build_id| build_id.to_string()),
     }
 }
 
@@ -1561,17 +1701,26 @@ fn c2c_stats_result(stats: &C2cStats) -> C2cCachelineStats {
         local_peer: stats.local_peer,
         remote_peer: stats.remote_peer,
         locked: stats.locked,
+        exact_ip_samples: stats.exact_ip_samples,
+        non_exact_ip_samples: stats.samples.saturating_sub(stats.exact_ip_samples),
+        non_unit_weight_samples: stats.non_unit_weight_samples,
         average_weight: stats.average_weight(),
+        instruction_latency_samples: stats.instruction_latency_samples,
         average_instruction_latency: stats.average_instruction_latency(),
     }
 }
 
-fn average_u128(sum: u128, count: usize) -> f64 {
-    if count == 0 {
-        0.0
-    } else {
-        sum as f64 / count as f64
+fn validate_c2c_latency_sort(
+    sort_by: &str,
+    matched_memory_samples: usize,
+    stats: &C2cStats,
+) -> Result<(), String> {
+    if sort_by == "latency" && stats.instruction_latency_samples == 0 {
+        return Err(format!(
+            "cannot sort by latency: none of the {matched_memory_samples} memory samples matched by the requested filters contains instruction-latency data"
+        ));
     }
+    Ok(())
 }
 
 fn align_cacheline(address: u64, cacheline_size: u64) -> u64 {
@@ -2840,71 +2989,6 @@ pub struct ProfileInfoResult {
     pub categories: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct C2cStats {
-    samples: usize,
-    loads: usize,
-    stores: usize,
-    local_hitm: usize,
-    remote_hitm: usize,
-    local_peer: usize,
-    remote_peer: usize,
-    locked: usize,
-    weight_sum: u128,
-    instruction_latency_sum: u128,
-    instruction_latency_samples: usize,
-}
-
-impl C2cStats {
-    fn add_sample(&mut self, sample: &C2cSample) {
-        let source = sample.data_source;
-        self.samples += 1;
-        self.loads += usize::from(source.is_load());
-        self.stores += usize::from(source.is_store());
-        self.locked += usize::from(source.is_locked());
-        if source.is_hitm() {
-            if source.is_remote() {
-                self.remote_hitm += 1;
-            } else {
-                self.local_hitm += 1;
-            }
-        }
-        if source.is_peer() {
-            if source.is_remote() {
-                self.remote_peer += 1;
-            } else {
-                self.local_peer += 1;
-            }
-        }
-        self.weight_sum += u128::from(sample.weight);
-        if let Some(latency) = sample.instruction_latency {
-            self.instruction_latency_sum += u128::from(latency);
-            self.instruction_latency_samples += 1;
-        }
-    }
-
-    fn total_hitm(&self) -> usize {
-        self.local_hitm + self.remote_hitm
-    }
-
-    fn total_peer(&self) -> usize {
-        self.local_peer + self.remote_peer
-    }
-
-    fn average_weight(&self) -> f64 {
-        average_u128(self.weight_sum, self.samples)
-    }
-
-    fn average_instruction_latency(&self) -> Option<f64> {
-        (self.instruction_latency_samples > 0).then(|| {
-            average_u128(
-                self.instruction_latency_sum,
-                self.instruction_latency_samples,
-            )
-        })
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct C2cProfileSummary {
     pub arch: Option<String>,
@@ -2913,13 +2997,40 @@ pub struct C2cProfileSummary {
     pub event_names: Vec<String>,
     pub cacheline_size: u64,
     pub duration_ms: f64,
+    /// All PERF_RECORD_SAMPLE records, including events without PERF_SAMPLE_DATA_SRC.
+    pub total_sample_records: usize,
+    /// Sample records whose event format contains PERF_SAMPLE_DATA_SRC, including records
+    /// later excluded for a missing or zero data address.
     pub total_memory_samples: usize,
+    /// Memory sample records retained for analysis after requiring a nonzero data address.
+    pub usable_memory_samples: usize,
+    /// Address attribution currently uses the exact PERF_SAMPLE_IP value without adjustment.
+    pub instruction_ip_policy: String,
+    /// Capture-wide aggregate over every usable memory sample, before request filters.
+    pub global_stats: C2cCachelineStats,
+    /// Capture-wide aggregate grouped by the decoded PERF_SAMPLE_DATA_SRC memory level.
+    pub global_memory_levels: Vec<C2cMemoryLevelRow>,
     pub samples_with_callchains: usize,
     pub matched_memory_samples: usize,
     pub skipped_non_memory_samples: usize,
     pub missing_data_address_samples: usize,
     pub missing_physical_address_samples: usize,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct C2cMemoryLevelRow {
+    pub memory_level: String,
+    pub stats: C2cCachelineStats,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct C2cRawDataSourceRow {
+    /// Exact, unmodified PERF_SAMPLE_DATA_SRC value from the capture.
+    pub raw_data_source: String,
+    pub operation: String,
+    pub memory_level: String,
+    pub stats: C2cCachelineStats,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2949,6 +3060,8 @@ pub struct C2cCachelineRow {
 pub struct C2cTopCachelinesResult {
     pub profile: C2cProfileSummary,
     pub sort_by: String,
+    pub matched_stats: C2cCachelineStats,
+    pub matched_memory_levels: Vec<C2cMemoryLevelRow>,
     pub total_matched_hitm: usize,
     pub total_matched_peer: usize,
     pub cachelines: Vec<C2cCachelineRow>,
@@ -2985,6 +3098,10 @@ pub struct C2cTopAccessSiteRow {
     pub site_id: String,
     pub instruction_address: String,
     pub instruction_addresses: Vec<String>,
+    /// Exact, unmodified PERF_SAMPLE_IP values represented by this site.
+    pub raw_sampled_ips: Vec<String>,
+    /// Exact PERF_SAMPLE_DATA_SRC values and their decoded aggregate statistics.
+    pub raw_data_sources: Vec<C2cRawDataSourceRow>,
     pub relative_instruction_address: Option<String>,
     pub function_name: Option<String>,
     pub dso: Option<String>,
@@ -3003,6 +3120,10 @@ pub struct C2cTopAccessSiteRow {
     pub local_peer: usize,
     pub remote_peer: usize,
     pub locked: usize,
+    pub exact_ip_samples: usize,
+    pub non_exact_ip_samples: usize,
+    pub non_unit_weight_samples: usize,
+    pub instruction_latency_samples: usize,
     pub average_weight: f64,
     pub average_instruction_latency: Option<f64>,
     pub distinct_virtual_cachelines: usize,
@@ -3018,6 +3139,8 @@ pub struct C2cTopAccessSiteRow {
 pub struct C2cTopAccessSitesResult {
     pub profile: C2cProfileSummary,
     pub sort_by: String,
+    pub matched_stats: C2cCachelineStats,
+    pub matched_memory_levels: Vec<C2cMemoryLevelRow>,
     pub grouped_by_callchain: bool,
     pub total_access_sites: usize,
     pub access_sites: Vec<C2cTopAccessSiteRow>,
@@ -3035,8 +3158,31 @@ pub struct C2cAccessedCachelineRow {
     pub pid: i32,
     pub cacheline_address: String,
     pub physical_cacheline_addresses: Vec<String>,
+    /// Recorded MMAP/MMAP2 regions containing sampled data addresses on this line.
+    pub data_mappings: Vec<C2cDataMappingRow>,
     pub stats: C2cCachelineStats,
     pub offsets: Vec<C2cOffsetRow>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct C2cDataMappingRow {
+    pub path: String,
+    pub mapping_start: String,
+    pub mapping_end: String,
+    pub page_offset: String,
+    pub build_id: Option<String>,
+    pub stats: C2cCachelineStats,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct C2cMappedDataAddress {
+    pub path: String,
+    pub mapping_start: String,
+    pub mapping_end: String,
+    pub page_offset: String,
+    pub mapping_offset: String,
+    pub file_offset: String,
+    pub build_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -3082,6 +3228,10 @@ pub struct C2cAccessSiteDetailResult {
     pub site_id: String,
     pub instruction_address: String,
     pub instruction_addresses: Vec<String>,
+    /// Exact, unmodified PERF_SAMPLE_IP values represented by this site.
+    pub raw_sampled_ips: Vec<String>,
+    /// Exact PERF_SAMPLE_DATA_SRC values and their decoded aggregate statistics.
+    pub raw_data_sources: Vec<C2cRawDataSourceRow>,
     pub relative_instruction_address: Option<String>,
     pub function_name: Option<String>,
     pub dso: Option<String>,
@@ -3109,6 +3259,13 @@ pub struct C2cAccessSiteRow {
     pub offset: u64,
     pub data_address: String,
     pub instruction_address: String,
+    /// Exact, unmodified PERF_SAMPLE_IP value. This is an explicit alias for
+    /// instruction_address for consumers that must distinguish raw and resolved addresses.
+    pub raw_sampled_ip: String,
+    /// Whether PERF_RECORD_MISC_EXACT_IP was set on these samples.
+    pub exact_ip: bool,
+    /// Recorded mapping containing this data address, when perf captured one.
+    pub data_mapping: Option<C2cMappedDataAddress>,
     pub function_name: Option<String>,
     pub dso: Option<String>,
     pub file: Option<String>,
@@ -3121,6 +3278,8 @@ pub struct C2cAccessSiteRow {
     pub operation: String,
     pub memory_level: String,
     pub data_source: String,
+    /// Exact PERF_SAMPLE_DATA_SRC value. This is an explicit alias for data_source.
+    pub raw_data_source: String,
     pub samples: usize,
     pub total_hitm: usize,
     pub local_hitm: usize,
@@ -3138,6 +3297,7 @@ pub struct C2cCachelineDetailResult {
     pub profile: C2cProfileSummary,
     pub cacheline_address: String,
     pub physical_cacheline_addresses: Vec<String>,
+    pub data_mappings: Vec<C2cDataMappingRow>,
     pub stats: C2cCachelineStats,
     pub access_sites: Vec<C2cAccessSiteRow>,
     pub symbolication_warnings: Vec<String>,
@@ -3155,7 +3315,11 @@ pub struct C2cCachelineStats {
     pub local_peer: usize,
     pub remote_peer: usize,
     pub locked: usize,
+    pub exact_ip_samples: usize,
+    pub non_exact_ip_samples: usize,
+    pub non_unit_weight_samples: usize,
     pub average_weight: f64,
+    pub instruction_latency_samples: usize,
     pub average_instruction_latency: Option<f64>,
 }
 
@@ -3594,6 +3758,7 @@ impl ProfileServer {
 
         let mut cachelines: HashMap<u64, C2cCachelineAccum> = HashMap::new();
         let mut totals = C2cStats::default();
+        let mut memory_levels: BTreeMap<&'static str, C2cStats> = BTreeMap::new();
         let mut matched_memory_samples = 0;
         for sample in profile
             .samples
@@ -3602,6 +3767,10 @@ impl ProfileServer {
         {
             matched_memory_samples += 1;
             totals.add_sample(sample);
+            memory_levels
+                .entry(sample.data_source.level())
+                .or_default()
+                .add_sample(sample);
             let address = align_cacheline(sample.data_address, profile.cacheline_size);
             cachelines
                 .entry(address)
@@ -3659,6 +3828,8 @@ impl ProfileServer {
         Ok(Json(C2cTopCachelinesResult {
             profile: c2c_profile_summary(&profile, matched_memory_samples),
             sort_by,
+            matched_stats: c2c_stats_result(&totals),
+            matched_memory_levels: c2c_memory_level_rows(&memory_levels),
             total_matched_hitm: total_hitm,
             total_matched_peer: total_peer,
             cachelines,
@@ -3694,6 +3865,8 @@ impl ProfileServer {
 
         let include_callchains = req.include_callchains || req.group_by_callchain;
         let mut sites: HashMap<C2cSiteKey, C2cSiteAccum> = HashMap::new();
+        let mut totals = C2cStats::default();
+        let mut memory_levels: BTreeMap<&'static str, C2cStats> = BTreeMap::new();
         let mut matched_memory_samples = 0;
         for sample in profile
             .samples
@@ -3701,6 +3874,11 @@ impl ProfileServer {
             .filter(|sample| filter.matches(&profile, sample))
         {
             matched_memory_samples += 1;
+            totals.add_sample(sample);
+            memory_levels
+                .entry(sample.data_source.level())
+                .or_default()
+                .add_sample(sample);
             let key = C2cSiteKey::for_sample(sample, req.group_by_callchain);
             let grouped_callchain = req
                 .group_by_callchain
@@ -3710,6 +3888,8 @@ impl ProfileServer {
                 .or_insert_with(|| C2cSiteAccum::new(key, grouped_callchain))
                 .add_sample(sample, profile.cacheline_size, include_callchains);
         }
+
+        validate_c2c_latency_sort(&sort_by, matched_memory_samples, &totals)?;
 
         let total_access_sites = sites.len();
         let mut sites: Vec<_> = sites.into_values().collect();
@@ -3752,6 +3932,7 @@ impl ProfileServer {
                     .first()
                     .cloned()
                     .unwrap_or_else(|| format_address(site.key.instruction.raw_address));
+                let raw_sampled_ips = instruction_addresses.clone();
                 let grouped_callchain =
                     site.grouped_callchain
                         .as_deref()
@@ -3772,6 +3953,8 @@ impl ProfileServer {
                     site_id,
                     instruction_address,
                     instruction_addresses,
+                    raw_sampled_ips,
+                    raw_data_sources: c2c_raw_data_source_rows(site.data_sources),
                     relative_instruction_address: mapped
                         .map(|mapped| format_address(mapped.relative_address)),
                     function_name: resolved.function_name,
@@ -3791,6 +3974,13 @@ impl ProfileServer {
                     local_peer: site.stats.local_peer,
                     remote_peer: site.stats.remote_peer,
                     locked: site.stats.locked,
+                    exact_ip_samples: site.stats.exact_ip_samples,
+                    non_exact_ip_samples: site
+                        .stats
+                        .samples
+                        .saturating_sub(site.stats.exact_ip_samples),
+                    non_unit_weight_samples: site.stats.non_unit_weight_samples,
+                    instruction_latency_samples: site.stats.instruction_latency_samples,
                     average_weight: site.stats.average_weight(),
                     average_instruction_latency: site.stats.average_instruction_latency(),
                     distinct_virtual_cachelines: site.virtual_cachelines.len(),
@@ -3807,6 +3997,8 @@ impl ProfileServer {
         Ok(Json(C2cTopAccessSitesResult {
             profile: c2c_profile_summary(&profile, matched_memory_samples),
             sort_by,
+            matched_stats: c2c_stats_result(&totals),
+            matched_memory_levels: c2c_memory_level_rows(&memory_levels),
             grouped_by_callchain: req.group_by_callchain,
             total_access_sites,
             access_sites,
@@ -3957,6 +4149,7 @@ impl ProfileServer {
                         .into_iter()
                         .map(format_address)
                         .collect(),
+                    data_mappings: c2c_data_mapping_rows(line.data_mappings),
                     stats: c2c_stats_result(&line.stats),
                     offsets: line_offsets
                         .into_iter()
@@ -4096,6 +4289,7 @@ impl ProfileServer {
             .first()
             .cloned()
             .unwrap_or_else(|| format_address(site.key.instruction.raw_address));
+        let raw_sampled_ips = instruction_addresses.clone();
         let returned_cachelines = cachelines.len();
         let next_cacheline_offset = (cacheline_offset + returned_cachelines
             < distinct_virtual_cachelines)
@@ -4106,6 +4300,8 @@ impl ProfileServer {
             site_id,
             instruction_address,
             instruction_addresses,
+            raw_sampled_ips,
+            raw_data_sources: c2c_raw_data_source_rows(site.data_sources),
             relative_instruction_address: mapped
                 .map(|mapped| format_address(mapped.relative_address)),
             function_name: resolved.function_name,
@@ -4158,6 +4354,7 @@ impl ProfileServer {
 
         let mut stats = C2cStats::default();
         let mut physical_addresses = BTreeSet::new();
+        let mut data_mappings: HashMap<C2cDataMappingKey, C2cStats> = HashMap::new();
         let mut access_sites: HashMap<C2cAccessKey, C2cAccessAccum> = HashMap::new();
         for sample in profile.samples.iter().filter(|sample| {
             filter.matches(&profile, sample)
@@ -4167,6 +4364,12 @@ impl ProfileServer {
             if let Some(address) = sample.physical_address {
                 physical_addresses.insert(align_cacheline(address, profile.cacheline_size));
             }
+            if let Some(mapped) = &sample.mapped_data_address {
+                data_mappings
+                    .entry(mapped.into())
+                    .or_default()
+                    .add_sample(sample);
+            }
             let key = C2cAccessKey {
                 offset: sample.data_address - cacheline_address,
                 pid: sample.pid,
@@ -4174,7 +4377,9 @@ impl ProfileServer {
                 cpu: sample.cpu,
                 thread_name: Arc::clone(&sample.thread_name),
                 instruction_address: sample.instruction_address,
+                exact_ip: sample.exact_ip,
                 data_source: sample.data_source,
+                mapped_data_address: sample.mapped_data_address.clone(),
                 mapped_instruction: sample.mapped_instruction.clone(),
             };
             access_sites
@@ -4225,6 +4430,9 @@ impl ProfileServer {
                     offset: key.offset,
                     data_address: format_address(cacheline_address + key.offset),
                     instruction_address: format_address(key.instruction_address),
+                    raw_sampled_ip: format_address(key.instruction_address),
+                    exact_ip: key.exact_ip,
+                    data_mapping: key.mapped_data_address.map(c2c_mapped_data_address),
                     function_name: resolved.function_name,
                     dso: key
                         .mapped_instruction
@@ -4240,6 +4448,7 @@ impl ProfileServer {
                     operation: key.data_source.operation().to_string(),
                     memory_level: key.data_source.level().to_string(),
                     data_source: format!("0x{:x}", key.data_source.raw),
+                    raw_data_source: format!("0x{:x}", key.data_source.raw),
                     samples: access.stats.samples,
                     total_hitm: access.stats.total_hitm(),
                     local_hitm: access.stats.local_hitm,
@@ -4266,6 +4475,7 @@ impl ProfileServer {
                 .into_iter()
                 .map(format_address)
                 .collect(),
+            data_mappings: c2c_data_mapping_rows(data_mappings),
             stats: c2c_stats_result(&stats),
             access_sites,
             symbolication_warnings,
@@ -6339,7 +6549,9 @@ mod tests {
             cpu,
             thread_name: Arc::from("worker"),
             instruction_address: 0x1234,
+            exact_ip: true,
             data_address,
+            mapped_data_address: None,
             physical_address: Some(physical_address),
             weight: 100,
             instruction_latency: Some(120),
@@ -6370,11 +6582,35 @@ mod tests {
         assert_eq!(site.hitm_cacheline_count(), 2);
         assert_eq!(site.physical_cachelines.len(), 2);
         assert_eq!(site.callchains.len(), 1);
+        assert_eq!(site.data_sources.len(), 1);
+        let data_source_rows = c2c_raw_data_source_rows(site.data_sources.clone());
+        assert_eq!(data_source_rows[0].raw_data_source, "0x83629808042");
+        assert_eq!(data_source_rows[0].stats.samples, 3);
+        assert_eq!(data_source_rows[0].stats.remote_hitm, 3);
         assert_eq!(c2c_site_id(&key), site_id);
         assert_ne!(
             c2c_site_id(&C2cSiteKey::for_sample(&samples[0], true)),
             site_id
         );
         assert!(select_c2c_site_key(&samples[0], None, Some(&site_id)).is_some());
+    }
+
+    #[test]
+    fn c2c_latency_sort_requires_latency_samples() {
+        let stats = C2cStats {
+            samples: 42,
+            ..C2cStats::default()
+        };
+        assert_eq!(
+            validate_c2c_latency_sort("latency", 42, &stats).unwrap_err(),
+            "cannot sort by latency: none of the 42 memory samples matched by the requested filters contains instruction-latency data"
+        );
+        assert!(validate_c2c_latency_sort("hitm", 42, &stats).is_ok());
+
+        let stats = C2cStats {
+            instruction_latency_samples: 1,
+            ..stats
+        };
+        assert!(validate_c2c_latency_sort("latency", 42, &stats).is_ok());
     }
 }

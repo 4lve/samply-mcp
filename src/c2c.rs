@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use linux_perf_data::linux_perf_event_reader::constants::PERF_RECORD_MISC_EXACT_IP;
 use linux_perf_data::linux_perf_event_reader::{
     BranchSampleFormat, Endianness, EventRecord, Mmap2FileId, RawData, ReadFormat, RecordParseInfo,
     SampleFormat,
@@ -24,6 +25,9 @@ pub struct C2cProfile {
     pub last_timestamp_ns: Option<u64>,
     pub samples: Vec<C2cSample>,
     pub samples_with_callchains: usize,
+    pub memory_sample_records: usize,
+    pub global_stats: C2cStats,
+    pub global_memory_levels: BTreeMap<&'static str, C2cStats>,
     pub skipped_samples: usize,
     pub missing_data_address_samples: usize,
     pub missing_physical_address_samples: usize,
@@ -37,7 +41,9 @@ pub struct C2cSample {
     pub cpu: u32,
     pub thread_name: Arc<str>,
     pub instruction_address: u64,
+    pub exact_ip: bool,
     pub data_address: u64,
+    pub mapped_data_address: Option<MappedDataAddress>,
     pub physical_address: Option<u64>,
     pub weight: u64,
     pub instruction_latency: Option<u16>,
@@ -46,10 +52,98 @@ pub struct C2cSample {
     pub callchain: Arc<[C2cCallchainFrame]>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct C2cStats {
+    pub samples: usize,
+    pub loads: usize,
+    pub stores: usize,
+    pub local_hitm: usize,
+    pub remote_hitm: usize,
+    pub local_peer: usize,
+    pub remote_peer: usize,
+    pub locked: usize,
+    pub exact_ip_samples: usize,
+    pub non_unit_weight_samples: usize,
+    pub weight_sum: u128,
+    pub instruction_latency_sum: u128,
+    pub instruction_latency_samples: usize,
+}
+
+impl C2cStats {
+    pub fn add_sample(&mut self, sample: &C2cSample) {
+        let source = sample.data_source;
+        self.samples += 1;
+        self.loads += usize::from(source.is_load());
+        self.stores += usize::from(source.is_store());
+        self.locked += usize::from(source.is_locked());
+        self.exact_ip_samples += usize::from(sample.exact_ip);
+        self.non_unit_weight_samples += usize::from(sample.weight != 1);
+        if source.is_hitm() {
+            if source.is_remote() {
+                self.remote_hitm += 1;
+            } else {
+                self.local_hitm += 1;
+            }
+        }
+        if source.is_peer() {
+            if source.is_remote() {
+                self.remote_peer += 1;
+            } else {
+                self.local_peer += 1;
+            }
+        }
+        self.weight_sum += u128::from(sample.weight);
+        if let Some(latency) = sample.instruction_latency {
+            self.instruction_latency_sum += u128::from(latency);
+            self.instruction_latency_samples += 1;
+        }
+    }
+
+    pub fn total_hitm(&self) -> usize {
+        self.local_hitm + self.remote_hitm
+    }
+
+    pub fn total_peer(&self) -> usize {
+        self.local_peer + self.remote_peer
+    }
+
+    pub fn average_weight(&self) -> f64 {
+        average_u128(self.weight_sum, self.samples)
+    }
+
+    pub fn average_instruction_latency(&self) -> Option<f64> {
+        (self.instruction_latency_samples > 0).then(|| {
+            average_u128(
+                self.instruction_latency_sum,
+                self.instruction_latency_samples,
+            )
+        })
+    }
+}
+
+fn average_u128(sum: u128, count: usize) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        sum as f64 / count as f64
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MappedInstruction {
     pub path: Arc<str>,
     pub relative_address: u64,
+    pub build_id: Option<Arc<str>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MappedDataAddress {
+    pub path: Arc<str>,
+    pub mapping_start: u64,
+    pub mapping_end: u64,
+    pub page_offset: u64,
+    pub mapping_offset: u64,
+    pub file_offset: u64,
     pub build_id: Option<Arc<str>>,
 }
 
@@ -145,6 +239,7 @@ struct Mapping {
     page_offset: u64,
     path: Arc<str>,
     build_id: Option<Arc<str>>,
+    executable: bool,
 }
 
 #[derive(Default)]
@@ -175,6 +270,7 @@ impl ProcessState {
     fn resolve_instruction(&self, pid: i32, address: u64) -> Option<MappedInstruction> {
         self.find_mapping(pid, address)
             .or_else(|| self.find_mapping(-1, address))
+            .filter(|mapping| mapping.executable)
             .and_then(|mapping| {
                 let relative_address = address
                     .checked_sub(mapping.start)?
@@ -182,6 +278,23 @@ impl ProcessState {
                 Some(MappedInstruction {
                     path: Arc::clone(&mapping.path),
                     relative_address,
+                    build_id: mapping.build_id.clone(),
+                })
+            })
+    }
+
+    fn resolve_data_address(&self, pid: i32, address: u64) -> Option<MappedDataAddress> {
+        self.find_mapping(pid, address)
+            .or_else(|| self.find_mapping(-1, address))
+            .and_then(|mapping| {
+                let mapping_offset = address.checked_sub(mapping.start)?;
+                Some(MappedDataAddress {
+                    path: Arc::clone(&mapping.path),
+                    mapping_start: mapping.start,
+                    mapping_end: mapping.end,
+                    page_offset: mapping.page_offset,
+                    mapping_offset,
+                    file_offset: mapping_offset.checked_add(mapping.page_offset)?,
                     build_id: mapping.build_id.clone(),
                 })
             })
@@ -224,6 +337,9 @@ pub fn load_profile(path: &Path) -> Result<C2cProfile> {
     let mut state = ProcessState::default();
     let mut samples = Vec::new();
     let mut skipped_samples = 0;
+    let mut memory_sample_records = 0;
+    let mut global_stats = C2cStats::default();
+    let mut global_memory_levels: BTreeMap<&'static str, C2cStats> = BTreeMap::new();
     let mut samples_with_callchains = 0;
     let mut missing_data_address_samples = 0;
     let mut missing_physical_address_samples = 0;
@@ -251,7 +367,7 @@ pub fn load_profile(path: &Path) -> Result<C2cProfile> {
                     state.thread_names.insert(fork.tid, parent_name);
                 }
             }
-            EventRecord::Mmap(mmap) if mmap.is_executable => {
+            EventRecord::Mmap(mmap) => {
                 let path =
                     state.intern(String::from_utf8_lossy(&mmap.path.as_slice()).into_owned());
                 state.add_mapping(
@@ -262,10 +378,11 @@ pub fn load_profile(path: &Path) -> Result<C2cProfile> {
                         page_offset: mmap.page_offset,
                         path,
                         build_id: None,
+                        executable: mmap.is_executable,
                     },
                 );
             }
-            EventRecord::Mmap2(mmap) if mmap.protection & 0x4 != 0 => {
+            EventRecord::Mmap2(mmap) => {
                 let path =
                     state.intern(String::from_utf8_lossy(&mmap.path.as_slice()).into_owned());
                 let build_id = match mmap.file_id {
@@ -280,6 +397,7 @@ pub fn load_profile(path: &Path) -> Result<C2cProfile> {
                         page_offset: mmap.page_offset,
                         path,
                         build_id,
+                        executable: mmap.protection & 0x4 != 0,
                     },
                 );
             }
@@ -292,6 +410,7 @@ pub fn load_profile(path: &Path) -> Result<C2cProfile> {
                     skipped_samples += 1;
                     continue;
                 }
+                memory_sample_records += 1;
                 let sample = parse_memory_sample(record.data, &record.parse_info)
                     .context("failed to parse perf memory sample")?;
                 let Some(data_address) = sample.data_address.filter(|address| *address != 0) else {
@@ -327,14 +446,16 @@ pub fn load_profile(path: &Path) -> Result<C2cProfile> {
                     .collect::<Vec<_>>();
                 let callchain = state.intern_callchain(callchain);
                 samples_with_callchains += usize::from(!callchain.is_empty());
-                samples.push(C2cSample {
+                let sample = C2cSample {
                     timestamp_ns: sample.timestamp_ns,
                     pid,
                     tid,
                     cpu: sample.cpu.unwrap_or_default(),
                     thread_name,
                     instruction_address,
+                    exact_ip: record.misc & PERF_RECORD_MISC_EXACT_IP != 0,
                     data_address,
+                    mapped_data_address: state.resolve_data_address(pid, data_address),
                     physical_address,
                     weight: sample.weight.unwrap_or(1),
                     instruction_latency: sample.instruction_latency,
@@ -343,7 +464,13 @@ pub fn load_profile(path: &Path) -> Result<C2cProfile> {
                     },
                     mapped_instruction: state.resolve_instruction(pid, instruction_address),
                     callchain,
-                });
+                };
+                global_stats.add_sample(&sample);
+                global_memory_levels
+                    .entry(sample.data_source.level())
+                    .or_default()
+                    .add_sample(&sample);
+                samples.push(sample);
             }
             _ => {}
         }
@@ -363,6 +490,9 @@ pub fn load_profile(path: &Path) -> Result<C2cProfile> {
         last_timestamp_ns,
         samples,
         samples_with_callchains,
+        memory_sample_records,
+        global_stats,
+        global_memory_levels,
         skipped_samples,
         missing_data_address_samples,
         missing_physical_address_samples,
@@ -667,5 +797,28 @@ mod tests {
         assert_eq!(sample.instruction_latency, Some(654));
         assert_eq!(sample.data_source, 0x836_2980_8042);
         assert_eq!(sample.physical_address, Some(0x4a8f_90044));
+    }
+
+    #[test]
+    fn resolves_non_executable_data_mappings_without_treating_them_as_code() {
+        let mut state = ProcessState::default();
+        let path = state.intern("//anon".to_string());
+        state.add_mapping(
+            42,
+            Mapping {
+                start: 0x2000,
+                end: 0x3000,
+                page_offset: 0x1000,
+                path,
+                build_id: None,
+                executable: false,
+            },
+        );
+
+        let mapped = state.resolve_data_address(42, 0x2044).unwrap();
+        assert_eq!(mapped.mapping_offset, 0x44);
+        assert_eq!(mapped.file_offset, 0x1044);
+        assert_eq!(&*mapped.path, "//anon");
+        assert!(state.resolve_instruction(42, 0x2044).is_none());
     }
 }
