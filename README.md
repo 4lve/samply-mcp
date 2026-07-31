@@ -1,6 +1,6 @@
 # samply-mcp
 
-An MCP server that lets AI assistants analyze [samply](https://crates.io/crates/samply) CPU profiles. Register it once, then ask your assistant to analyze any profile by path — find hotspots, explore call trees, and explain what's slow.
+An MCP server that lets AI assistants analyze [samply](https://crates.io/crates/samply) CPU profiles and Linux `perf c2c` captures. Register it once, then ask your assistant to analyze any profile by path — find hotspots, explore call trees, identify contended cachelines, and explain what's slow.
 
 ## What it does
 
@@ -33,8 +33,12 @@ Every tool accepts a `path` parameter, so one server installation works for any 
 | `profile_markers` | Timeline markers and events |
 | `profile_context_switches` | On/off-CPU time, CPU migration, switch-out reasons, and longest scheduling gaps |
 | `profile_flamegraph` | Collapsed stack format, optionally focused or aggregated by thread-name prefix |
+| `c2c_top_cachelines` | Rank cachelines in a `perf c2c record` capture by HITM, peer, sample count, or weight, with process/thread/time filters |
+| `c2c_cacheline_detail` | Break one cacheline down by instruction, offset, thread, CPU, memory source, and latency, with local-binary DWARF source resolution |
+| `c2c_top_access_sites` | Rank instructions across all cachelines they accessed, with HITM/lock/latency statistics, distinct-line counts, inline frames, and optional callchains |
+| `c2c_access_site_detail` | Expand an instruction or stable site ID into its cachelines, offsets, co-accessors, callchains, and per-thread/per-CPU breakdowns |
 
-All tools require a `path` parameter pointing to a profile `.json` or `.json.gz` file. The most recently used profile is cached in memory. Concurrent requests for the same path share one load; requests for different paths are serialized so multiple large profiles are not inflated and retained at once. Large profiles are decoded one thread at a time, and repeated stacks, frames, marker strings, and analysis results remain shared or lazy.
+All tools require a `path` parameter. `profile_*` tools accept a Firefox Profiler `.json` or `.json.gz` file; `c2c_*` tools accept the native `perf.data` output from `perf c2c record`. The most recently used profile of each kind is cached in memory. Concurrent requests for the same Samply path share one load; requests for different paths are serialized so multiple large profiles are not inflated and retained at once. Large Samply profiles are decoded one thread at a time, and repeated stacks, frames, marker strings, and analysis results remain shared or lazy.
 
 Sample-based tools accept optional `start_time_ms` and `end_time_ms` bounds. The bounds are inclusive, measured relative to the first observed sample (`0` is profile start), and are applied before thread selection, totals, percentages, and tree construction. Results include an `effective_range` showing the requested range after it was clamped to the profile. `profile_info.observed_start_time_ms` exposes the first sample's original timestamp so profile-relative results can be aligned with logs that use the host-monotonic clock.
 
@@ -74,6 +78,18 @@ cargo samply --samply-args="--save-only --unstable-presymbolicate --cswitch-mark
 The command above is the full Linux workflow. On macOS, omit `--per-cpu-threads`, which samply does not support there.
 
 The context-switch markers and per-CPU tracks enable `profile_context_switches`. It reports observed on/off-CPU time, CPU usage and migration, `blocked` versus `preempted` switch-outs, and the longest off-CPU intervals. Off-CPU time following `blocked` includes the application's wait plus any delay before it runs again; context-switch markers alone cannot separate those two portions.
+
+### Recording cache-to-cache data on Linux
+
+Run the workload through `perf c2c record`, then pass the resulting native data file to the `c2c_*` tools:
+
+```bash
+perf c2c record -o /tmp/workload-c2c.data -- ./target/release/my-workload
+```
+
+Use `c2c_top_cachelines` when looking for one heavily shared line, then pass its `cacheline_address` to `c2c_cacheline_detail`. Use `c2c_top_access_sites` when one instruction—such as a lock operation over many heap objects—may be fragmented across many lines; pass its stable `site_id` or instruction address to `c2c_access_site_detail` for cacheline, offset, co-accessor, thread, CPU, and callchain attribution. All four tools accept `pid`, `tid`, `thread_name_prefix`, and profile-relative time filters. Source resolution uses the binary paths recorded in the capture, so keeping the exact binaries and their debug information available gives the best results. The parser is implemented in Rust and reads `perf.data` directly; it does not shell out to `perf c2c report`.
+
+The availability and precision of HITM, peer, physical-address, and instruction-latency fields depend on the processor, kernel, and selected `perf c2c` event. Cacheline size is currently assumed to be 64 bytes and is reported as a warning in every result.
 
 ## Installation
 

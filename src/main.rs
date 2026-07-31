@@ -1,4 +1,5 @@
 mod analysis;
+mod c2c;
 mod cli;
 mod mcp;
 mod profile;

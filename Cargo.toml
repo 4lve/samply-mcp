@@ -8,6 +8,7 @@ addr2line = "0.25"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
+linux-perf-data = "0.13"
 memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }
 object = "0.37"
